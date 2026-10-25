@@ -66,6 +66,14 @@ std::vector<uint8_t> encode(const Deposit& m) {
     write_blob(b, m.send_token);
     write_u32(b, m.ttl_seconds);
     write_blob(b, m.envelope);
+    write_blob(b, m.revoke_hash);  // always there (empty when the envelope can't be taken back), so it can't be cut off unnoticed
+    return b;
+}
+std::vector<uint8_t> encode(const Revoke& m) {
+    std::vector<uint8_t> b;
+    write_blob(b, m.mailbox_id);
+    write_blob(b, m.envelope_id);
+    write_blob(b, m.secret);
     return b;
 }
 
@@ -327,7 +335,9 @@ std::optional<Deposit> decode_deposit(const std::vector<uint8_t>& in) {
     auto token = fixed_blob(in, off, SEND_TOKEN_BYTES);
     auto ttl = read_u32(in.data(), in.size(), off);
     auto envelope = read_blob(in.data(), in.size(), off, MAX_ENVELOPE_BYTES);
-    if (!mailbox || !token || !ttl || !envelope || !at_end(in, off)) return std::nullopt;
+    auto revoke = read_blob(in.data(), in.size(), off, HASH_BYTES);
+    if (!mailbox || !token || !ttl || !envelope || !revoke || (!revoke->empty() && revoke->size() != HASH_BYTES) || !at_end(in, off)) return std::nullopt;
+    m.revoke_hash = std::move(*revoke);
     m.mailbox_id = std::move(*mailbox);
     m.send_token = std::move(*token);
     m.ttl_seconds = *ttl;
@@ -502,6 +512,15 @@ std::optional<KeyringChunk> decode_keyring_chunk(const std::vector<uint8_t>& in)
     const uint64_t expected_size = c.index + 1 < c.count ? KEYRING_CHUNK_BYTES : c.total_size - static_cast<uint64_t>(KEYRING_CHUNK_BYTES) * (c.count - 1);
     if (c.data.size() != expected_size) return std::nullopt;
     return c;
+}
+
+std::optional<Revoke> decode_revoke(const std::vector<uint8_t>& in) {
+    size_t off = 0;
+    auto mailbox = fixed_blob(in, off, MAILBOX_ID_BYTES);
+    auto envelope = fixed_blob(in, off, ENVELOPE_ID_BYTES);
+    auto secret = fixed_blob(in, off, 32);
+    if (!mailbox || !envelope || !secret || !at_end(in, off)) return std::nullopt;
+    return Revoke{std::move(*mailbox), std::move(*envelope), std::move(*secret)};
 }
 
 std::optional<PrekeyPut> decode_prekey_put(const std::vector<uint8_t>& in) {

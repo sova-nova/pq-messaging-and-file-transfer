@@ -18,6 +18,7 @@
 #include "archive.h"
 #include "attachment.h"
 #include "prekey_vault.h"
+#include "private_store.h"
 #include "envelope.h"
 #include "history_store.h"
 #include "identity_bundle.h"
@@ -66,6 +67,10 @@ public:
         int64_t last_resort_rotate_seconds = 7 * 86400;    // a new last-resort prekey each week
         int64_t retired_last_resort_keep_seconds = 14 * 86400;  // an old one is kept this long for envelopes still on their way
         int64_t unused_prekey_keep_seconds = 45 * 86400;   // a one-time prekey nobody has used is deleted after this
+        // Private chats (M7). For tests only: shifts this app's clock for everything about Private chats (what it stamps on a
+        // message, and what it takes the time to be when checking windows and expiring), to stand in for clock differences and
+        // the passing of time. Always 0 in the app.
+        int64_t private_clock_offset_seconds = 0;
         int attachment_status_fast_seconds = 4;   // how often to ask the relay who has fetched a file sent in the last 15 minutes
         int attachment_status_slow_seconds = 60;  // ...and for older ones
     };
@@ -364,6 +369,42 @@ public:
     // Bytes done and in all, for an upload or download under way. False if nothing is.
     bool attachment_progress(const std::string& file_id, uint64_t& done, uint64_t& total);
 
+    // --- Private chats (M7) ---
+    // A Private chat is a separate, timed conversation with a contact (one to one), next to the Saved chat with them. Its rule is
+    // fixed when it starts: how long messages last (1 hour, 1 day, 7 days or 30 days) and whether that counts from sending
+    // (mode 1) or from reading (mode 2). Messages live only in the private store, each under its own key, erased at expiry;
+    // never archived, never in the keyring, never restored. Read receipts are always sent in a Private chat (reading is what
+    // starts the timer in a from-reading chat, and the sender's copy follows it).
+    struct PrivateChatSummary {
+        std::string id;  // hex
+        std::string contact_fp, contact_name;
+        int mode = 1;
+        int64_t timer = 0;
+        int64_t created_at = 0;
+        bool started_by_me = false;
+        size_t unread = 0;
+    };
+    struct PrivateMessage {
+        std::string id;  // hex
+        bool outgoing = false;
+        std::string text;
+        int64_t sent_at = 0;
+        std::optional<int64_t> expires_at;  // when it goes from this device
+        int status = 0;                     // outgoing: HistoryStore::Status
+        bool read = false;                  // incoming: shown here; outgoing: read by them
+    };
+    std::vector<PrivateChatSummary> private_chats();
+    bool start_private_chat(const std::string& contact_fp, int mode, int64_t timer_seconds, std::string& chat_id, std::string& error);
+    std::vector<PrivateMessage> private_messages(const std::string& chat_id);
+    // The chat is on screen: its unread messages are now read (a from-reading timer starts) and the sender is told.
+    void mark_private_read(const std::string& chat_id);
+    bool send_private_text(const std::string& chat_id, const std::string& text, std::string& error);
+    // Takes back a message we sent that they haven't read: from the relay if it is still waiting there, and from their device if
+    // it reached it unread. Can't reach a message they have already seen.
+    bool retract_private_message(const std::string& chat_id, const std::string& message_id, std::string& error);
+    bool delete_private_message(const std::string& chat_id, const std::string& message_id);  // this device's copy only
+    bool delete_private_chat(const std::string& chat_id);                                    // this device's copy only
+
     // --- Prekeys (M6) ---
     // Where this device's pool of one-time prekeys stands, here and (as of the last check) on the relay.
     struct PrekeyInfo {
@@ -375,6 +416,7 @@ public:
     };
     PrekeyInfo prekey_info();
     std::filesystem::path prekey_store_path() const { return prekey_store_path_; }
+    std::filesystem::path private_store_path() const { return private_store_path_; }
 
     // --- Restoring after a reinstall (M4) ---
     // The keyring is what a reinstalled app needs, beyond the keys folder, to find and open its chats'
@@ -498,6 +540,13 @@ private:
     std::atomic<bool> xfer_cancel_{false};
     std::chrono::steady_clock::time_point next_attachment_check_{};
     void maintain_prekeys();
+    bool handle_private_record(const KeyStore::Contact& contact, const Bytes& their_fp, const chat::SignedRecord& sr);
+    bool queue_private_record(const PrivateStore::Chat& chat, chat::RecordType type, const Bytes& payload, Bytes* message_id, std::string& error);
+    void expire_private();
+    int64_t private_now() const;
+    std::unique_ptr<PrivateStore> private_;
+    std::filesystem::path private_store_path_;
+    std::chrono::steady_clock::time_point next_private_expiry_{};
     std::unique_ptr<PrekeyVault> prekeys_;
     Bytes last_used_prekey_;  // the one-time prekey the envelope just handled was sealed to, to delete once it is stored
     std::filesystem::path prekey_store_path_;

@@ -88,6 +88,7 @@ add_library(pq_core STATIC
     client/attachment.cpp
     client/prekey.cpp
     client/prekey_vault.cpp
+    client/private_store.cpp
     client/keyring.cpp
     client/envelope.cpp
     client/history_store.cpp

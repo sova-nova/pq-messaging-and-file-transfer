@@ -319,6 +319,29 @@ bool RelayClient::cancel_invite(const std::vector<uint8_t>& invite_hash, std::st
            read_reply(MessageType::RELAY_INVITE_CANCEL_OK, nullptr, error);
 }
 
+bool RelayClient::deposit_revocable(const std::vector<uint8_t>& mailbox_id, const std::vector<uint8_t>& send_token, const std::vector<uint8_t>& envelope,
+                                    uint32_t ttl_seconds, const std::vector<uint8_t>& revoke_hash, std::vector<uint8_t>* envelope_id, std::string& error) {
+    if (envelope.size() > relay::MAX_ENVELOPE_BYTES) {
+        error = "That message is too large for the relay";
+        return false;
+    }
+    relay::Deposit d;
+    d.mailbox_id = mailbox_id;
+    d.send_token = send_token;
+    d.envelope = envelope;
+    d.ttl_seconds = ttl_seconds;
+    d.revoke_hash = revoke_hash;
+    std::vector<uint8_t> reply;
+    if (!send_request(MessageType::RELAY_DEPOSIT, relay::encode(d), error) || !read_reply(MessageType::RELAY_DEPOSIT_OK, &reply, error)) return false;
+    auto ids = relay::decode_id_list(reply);
+    if (envelope_id) *envelope_id = (ids && !ids->ids.empty()) ? ids->ids.front() : std::vector<uint8_t>();
+    return true;
+}
+
+bool RelayClient::revoke(const std::vector<uint8_t>& mailbox_id, const std::vector<uint8_t>& envelope_id, const std::vector<uint8_t>& secret, std::string& error) {
+    return send_request(MessageType::RELAY_REVOKE, relay::encode(relay::Revoke{mailbox_id, envelope_id, secret}), error) && read_reply(MessageType::RELAY_REVOKE_OK, nullptr, error);
+}
+
 bool RelayClient::put_prekeys(const relay::PrekeyPut& put, relay::PrekeyStatus* status, std::string& error) {
     std::vector<uint8_t> payload;
     if (!send_request(MessageType::PREKEY_PUT, relay::encode(put), error) || !read_reply(MessageType::PREKEY_PUT_OK, &payload, error)) return false;

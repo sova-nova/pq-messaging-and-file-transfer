@@ -209,7 +209,7 @@ int main() {
         long long version = sqlite3_column_int64(st, 0);
         sqlite3_finalize(st);
         sqlite3_close(check);
-        CHECK(version == 8, "the schema version is now 8");
+        CHECK(version == 9, "the schema version is now 9");
         auto ms = migrated.members();
         CHECK(ms.size() == 1 && ms[0].invited_by.empty() && ms[0].envelopes == 2, "a mailbox from the first release shows as an operator invite, with its queued envelopes");
         CHECK(migrated.add_member_invite(box, id(0x71, 32), 10000, 20000, 2, 3) == RelayStore::IssueResult::Ok, "and it can vouch for a friend straight away");
@@ -281,6 +281,28 @@ int main() {
 
     }
 
+
+    std::cout << "Revocable deposits\n";
+    {
+        fs::path path = dir / "revoke.db";
+        RelayStore s(path);
+        const Bytes box = id(1), other = id(2);
+        s.add_invite(id(0xE1, 32), 99999);
+        s.add_invite(id(0xE2, 32), 99999);
+        s.register_mailbox(id(0xE1, 32), box, id(0x55, 64), id(0xAA, 32), 1000, 10);
+        s.register_mailbox(id(0xE2, 32), other, id(0x55, 64), id(0xAB, 32), 1000, 10);
+        const Bytes secret_hash = id(0x77, 32);
+        s.deposit(box, id(0xD1, 16), id(1, 50), id(0xAA, 32), 1000, 3600, 1 << 20, secret_hash);
+        s.deposit(box, id(0xD2, 16), id(2, 50), id(0xAA, 32), 1000, 3600, 1 << 20);
+        CHECK(!s.revoke(box, id(0xD1, 16), id(0x78, 32)), "a wrong secret can't take an envelope back");
+        CHECK(!s.revoke(other, id(0xD1, 16), secret_hash), "nor can the right one, for another mailbox");
+        CHECK(!s.revoke(box, id(0xD2, 16), secret_hash) && !s.revoke(box, id(0xD2, 16), Bytes()), "an envelope deposited without a revocation hash can't be taken back at all");
+        CHECK(s.revoke(box, id(0xD1, 16), secret_hash), "the right secret takes it back");
+        CHECK(!s.revoke(box, id(0xD1, 16), secret_hash), "once");
+        auto left = s.fetch(box, 0, 1500, 100);
+        CHECK(left.size() == 1 && left[0].id == id(0xD2, 16), "and only the other envelope is left to collect");
+        { RelayStore again(path); CHECK(again.fetch(box, 0, 1500, 100).size() == 1, "(reopening the database is fine: the new column is only added once)"); }
+    }
 
     std::cout << "Prekeys\n";
     {

@@ -47,7 +47,8 @@ RelayStore::RelayStore(const std::filesystem::path& db_path) {
          "  envelope BLOB NOT NULL,"
          "  deposited_at INTEGER NOT NULL,"
          "  expires_at INTEGER NOT NULL,"
-         "  token_hash BLOB);"
+         "  token_hash BLOB,"
+         "  revoke_hash BLOB);"
          "CREATE INDEX IF NOT EXISTS envelopes_by_mailbox ON envelopes(mailbox_id, seq);"
          "CREATE INDEX IF NOT EXISTS envelopes_by_expiry ON envelopes(expires_at);"
          // Version 8: prekeys (opaque signed blobs), each mailbox's pool generation, and takes counted per token per hour.
@@ -103,7 +104,7 @@ RelayStore::RelayStore(const std::filesystem::path& db_path) {
 
     // Schema versions: 1 = the first release (envelopes without token_hash), 2 = token hashes,
     // 3 = invites and mailboxes remember who vouched, 4 = chat archives, 5 = keyrings, 6 = a redacted flag on
-    // archive entries, 7 = current (attachments; new tables only). A brand-new database is created at the current shape and starts at 0.
+    // archive entries, 7 = attachments, 8 = prekeys, 9 = current (envelopes can carry a revocation hash). A brand-new database is created at the current shape and starts at 0.
     int64_t version = 0;
     {
         Stmt v(db_, "PRAGMA user_version");
@@ -115,7 +116,15 @@ RelayStore::RelayStore(const std::filesystem::path& db_path) {
         exec(db_, "ALTER TABLE mailboxes ADD COLUMN invited_by BLOB");
     }
     if (version == 4 || version == 5) exec(db_, "ALTER TABLE archive_entries ADD COLUMN redacted INTEGER NOT NULL DEFAULT 0");
-    if (version < 8) exec(db_, "PRAGMA user_version=8");
+    if (version >= 1 && version <= 8) {
+        bool has_column = false;
+        {
+            Stmt c(db_, "SELECT 1 FROM pragma_table_info('envelopes') WHERE name = 'revoke_hash'");
+            has_column = c.step();
+        }
+        if (!has_column) exec(db_, "ALTER TABLE envelopes ADD COLUMN revoke_hash BLOB");
+    }
+    if (version < 9) exec(db_, "PRAGMA user_version=9");
 }
 
 RelayStore::~RelayStore() { sqlite3_close(db_); }
@@ -292,7 +301,7 @@ bool RelayStore::revoke_token(const Bytes& mailbox_id, const Bytes& token_hash) 
 }
 
 RelayStore::DepositResult RelayStore::deposit(const Bytes& mailbox_id, const Bytes& envelope_id, const Bytes& envelope,
-                                              const Bytes& token_hash, int64_t now, uint32_t ttl_seconds, size_t quota_bytes) {
+                                              const Bytes& token_hash, int64_t now, uint32_t ttl_seconds, size_t quota_bytes, const Bytes& revoke_hash) {
     std::lock_guard<std::mutex> lock(mutex_);
     Transaction tx(db_);
     {
@@ -301,11 +310,20 @@ RelayStore::DepositResult RelayStore::deposit(const Bytes& mailbox_id, const Byt
         size_t bytes = used.step() ? static_cast<size_t>(used.column_i64(0)) : 0;
         if (bytes + envelope.size() > quota_bytes) return DepositResult::MailboxFull;
     }
-    Stmt(db_, "INSERT INTO envelopes(id, mailbox_id, size, envelope, deposited_at, expires_at, token_hash) VALUES(?, ?, ?, ?, ?, ?, ?)")
-        .blob(1, envelope_id).blob(2, mailbox_id).i64(3, static_cast<int64_t>(envelope.size()))
-        .blob(4, envelope).i64(5, now).i64(6, now + static_cast<int64_t>(ttl_seconds)).blob(7, token_hash).step();
+    Stmt ins(db_, "INSERT INTO envelopes(id, mailbox_id, size, envelope, deposited_at, expires_at, token_hash, revoke_hash) VALUES(?, ?, ?, ?, ?, ?, ?, ?)");
+    ins.blob(1, envelope_id).blob(2, mailbox_id).i64(3, static_cast<int64_t>(envelope.size()))
+        .blob(4, envelope).i64(5, now).i64(6, now + static_cast<int64_t>(ttl_seconds)).blob(7, token_hash);
+    ins.blob(8, revoke_hash);  // empty when the envelope can't be taken back (and revoke() never matches an empty hash)
+    ins.step();
     tx.commit();
     return DepositResult::Ok;
+}
+
+bool RelayStore::revoke(const Bytes& mailbox_id, const Bytes& envelope_id, const Bytes& revoke_hash) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (revoke_hash.empty()) return false;
+    Stmt(db_, "DELETE FROM envelopes WHERE mailbox_id = ? AND id = ? AND revoke_hash IS NOT NULL AND revoke_hash = ?").blob(1, mailbox_id).blob(2, envelope_id).blob(3, revoke_hash).step();
+    return sqlite3_changes(db_) > 0;
 }
 
 std::vector<RelayStore::Stored> RelayStore::fetch(const Bytes& mailbox_id, int64_t after_seq, int64_t now, size_t limit) {

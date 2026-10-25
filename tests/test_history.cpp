@@ -3,6 +3,7 @@
 #include "history_store.h"
 #include "prekey.h"
 #include "prekey_vault.h"
+#include "private_store.h"
 
 #include <sqlite3.h>
 
@@ -790,6 +791,80 @@ int main() {
         CHECK(h.peer_had_prekeys(fp_a) && !h.peer_had_prekeys(fp_b), "a contact sealed to once is remembered, and only that one");
         HistoryStore again(dir / "peer-prekeys.db", key);
         CHECK(again.peer_had_prekeys(fp_a), "and it survives a restart");
+    }
+
+    std::cout << "The private store\n";
+    {
+        const fs::path pp = dir / "private.db";
+        const Bytes pkey = id(0x35, 32), conv = id(0x51, 16), other_conv = id(0x52, 16);
+        const std::string marker = "PRIVATE-MESSAGE-MARKER-0123456789-ABCDEFGHIJ";
+        auto msg = [&](const Bytes& c, uint8_t n, int64_t sent, std::optional<int64_t> expires, const std::string& text) {
+            PrivateStore::Message m;
+            m.conversation_id = c; m.message_id = id(n, 16); m.outgoing = false; m.sent_at = sent; m.received_at = sent; m.expires_at = expires;
+            m.record.assign(text.begin(), text.end());
+            return m;
+        };
+        {
+            PrivateStore ps(pp, pkey);
+            CHECK(ps.chats().empty() && ps.messages(conv).empty(), "a new private store is empty");
+            PrivateStore::Chat c{conv, fp_a, PrivateStore::FromReading, 86400, 1000, true};
+            CHECK(ps.add_chat(c) && !ps.add_chat(c), "a Private chat is added once");
+            auto got = ps.chat(conv);
+            CHECK(got && got->contact_fp == fp_a && got->mode == PrivateStore::FromReading && got->timer == 86400 && got->started_by_me && ps.chats().size() == 1, "and comes back with its rule");
+            CHECK(ps.add_message(msg(conv, 1, 1000, 5000, marker)) && ps.add_message(msg(conv, 2, 1100, std::nullopt, "no expiry yet")) && ps.add_message(msg(other_conv, 3, 1200, 9000, "elsewhere")),
+                  "messages are added, with or without a known expiry");
+            CHECK(!ps.add_message(msg(conv, 1, 1000, 5000, "a replay")), "the same message again (a replay) is refused");
+            auto ms = ps.messages(conv);
+            CHECK(ms.size() == 2 && std::string(ms[0].record.begin(), ms[0].record.end()) == marker && ms[0].expires_at == std::optional<int64_t>(5000) && !ms[1].expires_at && !ms[1].displayed_at,
+                  "a chat's messages come back in order, readable, each with its own expiry");
+            ps.set_displayed(conv, id(2, 16), 2000, 2000 + 86400);
+            ps.set_displayed(conv, id(2, 16), 3000, 9999999);  // shown again: the first time counts
+            auto m2 = ps.message(conv, id(2, 16));
+            CHECK(m2 && m2->displayed_at == std::optional<int64_t>(2000) && m2->expires_at == std::optional<int64_t>(2000 + 86400), "when a message is first shown is kept, with its new expiry, and showing it again changes nothing");
+            ps.set_status(conv, id(1, 16), 3);
+            CHECK(ps.message(conv, id(1, 16))->status == 3, "(delivery state is kept)");
+        }
+        CHECK(!file_contains(pp, marker) && !file_contains(fs::path(pp.string() + "-journal"), marker), "a message's text is not readable on disk");
+        Bytes sealed_body;
+        {
+            sqlite3* raw = nullptr;
+            sqlite3_open_v2(pp.string().c_str(), &raw, SQLITE_OPEN_READWRITE, nullptr);
+            sqlite3_stmt* st = nullptr;
+            sqlite3_prepare_v2(raw, "SELECT key_sealed FROM messages WHERE message_id = ?", -1, &st, nullptr);
+            const Bytes mid1 = id(1, 16);
+            sqlite3_bind_blob(st, 1, mid1.data(), static_cast<int>(mid1.size()), SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                const auto* b = static_cast<const uint8_t*>(sqlite3_column_blob(st, 0));
+                sealed_body.assign(b, b + sqlite3_column_bytes(st, 0));
+            }
+            sqlite3_finalize(st);
+            sqlite3_close(raw);
+        }
+        const std::string key_slice(sealed_body.begin() + 12, sealed_body.begin() + std::min<size_t>(sealed_body.size(), 44));
+        CHECK(sealed_body.size() >= 60 && file_contains(pp, key_slice), "(the message's own key is in the file, sealed)");
+        {
+            PrivateStore ps(pp, pkey);
+            CHECK(ps.expire(4999) == 0 && ps.message(conv, id(1, 16)), "before its time a message stays");
+            CHECK(ps.expire(5000) == 1 && !ps.message(conv, id(1, 16)) && ps.message(conv, id(2, 16)), "at its time it goes, and the others stay");
+        }
+        CHECK(!file_contains(pp, key_slice), "and its key is gone from the file: overwritten, not just unlinked, so the message can never be read again");
+        {
+            PrivateStore wrong(pp, id(0x36, 32));
+            CHECK(wrong.messages(conv).empty() && wrong.chat(conv), "with a different key no message can be read (the chat's rule is not secret)");
+        }
+        {
+            PrivateStore ps(pp, pkey);
+            CHECK(ps.erase_message(conv, id(2, 16)) && !ps.message(conv, id(2, 16)) && !ps.erase_message(conv, id(2, 16)), "a message can be deleted on its own (one's own copy, or a retraction), once");
+            ps.add_message(msg(conv, 4, 1300, std::nullopt, "never expires on its own"));
+            CHECK(ps.expire(99999999) == 1 && ps.message(conv, id(4, 16)), "a message with no expiry yet is never swept (only the other chat's one went)");
+            CHECK(ps.erase_chat(conv) == 1 && !ps.chat(conv) && ps.messages(conv).empty(), "deleting a chat deletes it and everything in it");
+        }
+        const fs::path damaged = dir / "damaged-private.db";
+        { std::ofstream f(damaged, std::ios::binary); f << std::string(5000, 'x'); }
+        {
+            PrivateStore ps(damaged, pkey);
+            CHECK(ps.chats().empty(), "a damaged private store is started afresh");
+        }
     }
 
     std::cout << "The prekey store\n";

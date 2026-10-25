@@ -273,6 +273,33 @@ int main() {
               "what each member signs covers the relay, the chat, the scope, the operation, the expiry and the entries in order");
     }
 
+    std::cout << "Revocable deposits\n";
+    {
+        Deposit plain{fill(1, MAILBOX_ID_BYTES), fill(2, SEND_TOKEN_BYTES), fill(3, 900), 3600};
+        Deposit revocable = plain;
+        revocable.revoke_hash = fill(4, HASH_BYTES);
+        auto pe = encode(plain), re = encode(revocable);
+        CHECK(re.size() == pe.size() + HASH_BYTES, "the revocation hash is always encoded (empty when there is none), so it can't be cut off unnoticed");
+        auto p2 = decode_deposit(pe), r2 = decode_deposit(re);
+        CHECK(p2 && p2->revoke_hash.empty() && r2 && r2->revoke_hash == revocable.revoke_hash && r2->envelope == plain.envelope, "both forms decode, the hash only when it is there");
+        Deposit short_hash = revocable;
+        short_hash.revoke_hash.pop_back();
+        Bytes two = re; write_blob(two, fill(5, HASH_BYTES));
+        Bytes trailing = re; trailing.push_back(0);
+        CHECK(!decode_deposit(encode(short_hash)) && !decode_deposit(two) && !decode_deposit(trailing), "a short hash, two hashes, or trailing bytes are rejected");
+        check_framing("plain deposit", pe, decode_deposit);
+        check_framing("revocable deposit", re, decode_deposit);
+        fuzz("revocable deposit", re, decode_deposit);
+        Revoke rv{fill(1, MAILBOX_ID_BYTES), fill(6, ENVELOPE_ID_BYTES), fill(7, 32)};
+        auto ve = encode(rv);
+        auto back = decode_revoke(ve);
+        CHECK(back && back->envelope_id == rv.envelope_id && back->secret == rv.secret, "a revocation round trips");
+        CHECK(!decode_revoke(encode(Revoke{fill(1, MAILBOX_ID_BYTES), fill(6, ENVELOPE_ID_BYTES), fill(7, 31)})) && !decode_revoke(encode(Revoke{fill(1, MAILBOX_ID_BYTES - 1), fill(6, ENVELOPE_ID_BYTES), fill(7, 32)})),
+              "and needs a full mailbox ID, envelope ID and secret");
+        check_framing("revoke", ve, decode_revoke);
+        fuzz("revoke", ve, decode_revoke);
+    }
+
     std::cout << "Prekey payloads\n";
     {
         PrekeyPut put;

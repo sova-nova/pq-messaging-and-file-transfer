@@ -659,7 +659,7 @@ int main() {
         CHECK(as_record(8, 2, Bytes(), 0, sp).has_value() && as_record(9, 2, Bytes(), 0, ap).has_value(), "(control) both parse as version 2 records");
         CHECK(!as_record(8, 1, Bytes(), 0, sp) && !as_record(9, 1, Bytes(), 0, ap), "...but not as version 1");
         CHECK(!as_record(8, 2, CryptoEngine::random_bytes(HASH_BYTES), 0, sp) && !as_record(9, 2, Bytes(), 1, ap), "they are outside the transcript: no previous entry, nothing seen");
-        CHECK(!as_record(8, 2, Bytes(), 0, Bytes(MAX_DELETE_REQUEST_PAYLOAD + 1, 1)) && !as_record(9, 2, Bytes(), 0, Bytes(MAX_DELETE_ACCEPT_PAYLOAD + 1, 1)) && !as_record(11, 2, Bytes(), 0, sp), "and their payloads have limits, and there is no type 11");
+        CHECK(!as_record(8, 2, Bytes(), 0, Bytes(MAX_DELETE_REQUEST_PAYLOAD + 1, 1)) && !as_record(9, 2, Bytes(), 0, Bytes(MAX_DELETE_ACCEPT_PAYLOAD + 1, 1)) && !as_record(13, 2, Bytes(), 0, sp), "and their payloads have limits, and there is no type 13");
     }
 
     std::cout << "The keyring\n";
@@ -1162,6 +1162,42 @@ int main() {
         Bytes version4 = encoded; version4[3] = 4;
         CHECK(prefixes && !decode_inner(trailing) && !decode_inner(version4), "every truncation, trailing bytes and a version this build doesn't know are rejected");
         (void)dup;
+    }
+
+    std::cout << "Private chat records\n";
+    {
+        bool all_round_trip = true;
+        for (uint32_t t : PRIVATE_TIMERS)
+            for (auto mode : {PrivateMode::FromSending, PrivateMode::FromReading}) {
+                auto back = parse_private_start_payload(private_start_payload(PrivateRule{mode, t}));
+                all_round_trip &= back && back->mode == mode && back->timer_seconds == t;
+            }
+        CHECK(all_round_trip, "every allowed rule (1 hour, 1 day, 7 days, 30 days; from sending or from reading) round trips");
+        CHECK(throws([] { private_start_payload(PrivateRule{PrivateMode::FromSending, 3599}); }) && throws([] { private_start_payload(PrivateRule{static_cast<PrivateMode>(3), 3600}); }) &&
+                  throws([] { private_start_payload(PrivateRule{PrivateMode::FromReading, 0}); }),
+              "a timer or mode that isn't allowed can't be made");
+        auto raw = [](uint32_t mode, uint32_t timer) { Bytes b; write_u32(b, mode); write_u32(b, timer); return b; };
+        Bytes trailing = raw(1, 3600); trailing.push_back(0);
+        CHECK(!parse_private_start_payload(raw(1, 3601)) && !parse_private_start_payload(raw(0, 3600)) && !parse_private_start_payload(raw(3, 86400)) && !parse_private_start_payload(trailing) &&
+                  !parse_private_start_payload(Bytes(4, 0)) && !parse_private_start_payload(Bytes()),
+              "a received rule with any other timer or mode, trailing bytes, or too few bytes is rejected");
+        const Bytes mid = CryptoEngine::random_bytes(16);
+        auto back = parse_retract_payload(retract_payload(mid));
+        Bytes rt = retract_payload(mid); rt.push_back(1);
+        Bytes rshort = retract_payload(mid); rshort.pop_back();
+        CHECK(back && *back == mid && !parse_retract_payload(rt) && !parse_retract_payload(rshort) &&
+                  throws([] { retract_payload(Bytes(15, 1)); }),
+              "a retraction names one message ID, exactly");
+        Bytes recipients = recipients_hash_for({alice.fingerprint, bob.fingerprint});
+        auto as_record = [&](uint32_t type, uint32_t version, const Bytes& own_prev, uint32_t seen_count, const Bytes& body) {
+            return parse_record(hand_record(alice, version, type, alice.fingerprint, recipients, body, own_prev,
+                                            [&](Bytes& b) { if (version == 1) write_blob(b, Bytes()); else { write_u32(b, seen_count); for (uint32_t i = 0; i < seen_count; i++) write_blob(b, CryptoEngine::random_bytes(HASH_BYTES)); } }));
+        };
+        const Bytes sp = private_start_payload(PrivateRule{PrivateMode::FromReading, 86400});
+        CHECK(as_record(11, 2, Bytes(), 0, sp) && as_record(12, 2, Bytes(), 0, retract_payload(mid)), "(control) both parse as version 2");
+        CHECK(!as_record(11, 1, Bytes(), 0, sp) && !as_record(12, 1, Bytes(), 0, retract_payload(mid)), "...but not as version 1");
+        CHECK(!as_record(11, 2, CryptoEngine::random_bytes(HASH_BYTES), 0, sp) && !as_record(12, 2, Bytes(), 1, retract_payload(mid)), "they are outside the transcript: no chain links");
+        CHECK(!as_record(11, 2, Bytes(), 0, Bytes(MAX_PRIVATE_START_PAYLOAD + 1, 1)) && !as_record(12, 2, Bytes(), 0, Bytes(MAX_RETRACT_PAYLOAD + 1, 1)), "and their payloads have limits");
     }
 
     std::cout << "X25519\n";

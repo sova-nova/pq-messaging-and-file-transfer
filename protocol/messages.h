@@ -86,6 +86,9 @@ enum class MessageType : uint8_t {
     ARCHIVE_FETCH      = 0x49,  // member → relay: send entries from a number onwards
     ARCHIVE_ENTRY      = 0x4A,  // relay → member: one entry
     ARCHIVE_FETCH_END  = 0x4B,  // relay → member: that was all; here is the head
+    // --- Taking back an uncollected envelope (M7) ---
+    RELAY_REVOKE       = 0x76,  // the sender → relay: delete this envelope, if it is still waiting (the secret proves it is theirs)
+    RELAY_REVOKE_OK    = 0x77,
     // --- Prekeys (M6): one-time keys a sender takes to give an envelope forward secrecy ---
     PREKEY_PUT         = 0x70,  // mailbox owner → relay: add prekeys (or replace them all)
     PREKEY_PUT_OK      = 0x71,  // relay → owner: how many are there now

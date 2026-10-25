@@ -61,6 +61,17 @@ struct Deposit {
     std::vector<uint8_t> send_token;        // the secret itself; the relay compares its hash
     std::vector<uint8_t> envelope;          // opaque to the relay
     uint32_t ttl_seconds = 0;               // how long the relay may keep it, from its own clock
+    std::vector<uint8_t> revoke_hash{};     // empty, or HASH_BYTES: the hash of a secret only the sender knows, which lets them
+                                            // take the envelope back while it is still waiting (Private chats, M7). Always encoded,
+                                            // even when empty, so it can't be stripped off unnoticed.
+};
+
+// Deletes an envelope that is still waiting, if `secret` hashes to the revoke_hash it was deposited with. Needs no sign-in: the
+// secret is the permission. A wrong secret and an envelope that is no longer there get the same answer.
+struct Revoke {
+    std::vector<uint8_t> mailbox_id;   // MAILBOX_ID_BYTES
+    std::vector<uint8_t> envelope_id;  // ENVELOPE_ID_BYTES, as the deposit's reply gave it
+    std::vector<uint8_t> secret;       // 32 bytes
 };
 
 struct StoredEnvelope {
@@ -291,6 +302,7 @@ std::vector<uint8_t> encode(const ArchiveFetch&);
 std::vector<uint8_t> encode(const ArchiveEntry&);
 std::vector<uint8_t> encode(const KeyringChunk&);
 std::vector<uint8_t> encode(const ArchiveDelete&);
+std::vector<uint8_t> encode(const Revoke&);
 std::vector<uint8_t> encode(const PrekeyPut&);
 std::vector<uint8_t> encode(const PrekeyTake&);
 std::vector<uint8_t> encode(const PrekeyData&);
@@ -326,6 +338,7 @@ std::optional<KeyringChunk> decode_keyring_chunk(const std::vector<uint8_t>&);
 std::optional<ArchiveDelete> decode_archive_delete(const std::vector<uint8_t>&);
 // A begin is valid only if its numbers fit together: the chunk count is what the total and chunk size
 // need, chunks are neither tiny nor over a message's worth, and every recipient's token hash is different.
+std::optional<Revoke> decode_revoke(const std::vector<uint8_t>&);
 std::optional<PrekeyPut> decode_prekey_put(const std::vector<uint8_t>&);
 std::optional<PrekeyTake> decode_prekey_take(const std::vector<uint8_t>&);
 std::optional<PrekeyData> decode_prekey_data(const std::vector<uint8_t>&);

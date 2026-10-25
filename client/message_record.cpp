@@ -51,6 +51,8 @@ bool well_formed(const Record& r) {
         case RecordType::Checkpoint: return r.payload.size() <= 8 + 4 + HASH_BYTES && r.own_prev.empty() && r.seen.empty();
         case RecordType::DeleteRequest: return r.payload.size() <= MAX_DELETE_REQUEST_PAYLOAD && r.own_prev.empty() && r.seen.empty();
         case RecordType::DeleteAccept: return r.payload.size() <= MAX_DELETE_ACCEPT_PAYLOAD && r.own_prev.empty() && r.seen.empty();
+        case RecordType::PrivateStart: return r.payload.size() <= MAX_PRIVATE_START_PAYLOAD && r.own_prev.empty() && r.seen.empty();
+        case RecordType::Retract: return r.payload.size() <= MAX_RETRACT_PAYLOAD && r.own_prev.empty() && r.seen.empty();
     }
     return false;
 }
@@ -185,7 +187,7 @@ std::optional<SignedRecord> parse_record(const Bytes& raw) {
         }
     }
     if (b != bd.size()) return std::nullopt;
-    const uint32_t newest_type = *version == 1 ? 3 : 10;  // Conversation, Forward, ArchiveGrant, Checkpoint and the delete records came with version 2
+    const uint32_t newest_type = *version == 1 ? 3 : 12;  // Conversation, Forward, ArchiveGrant, Checkpoint and the delete records came with version 2
     if (*type < 1 || *type > newest_type) return std::nullopt;
 
     r.conversation_id = std::move(*conv);
@@ -330,6 +332,43 @@ static bool valid_attachment(const AttachmentInfo& a) {
     for (unsigned char c : a.relay_address)
         if (c < 0x21 || c > 0x7E) return false;
     return true;
+}
+
+static bool allowed_timer(uint32_t t) {
+    for (uint32_t allowed : PRIVATE_TIMERS)
+        if (t == allowed) return true;
+    return false;
+}
+
+Bytes private_start_payload(const PrivateRule& rule) {
+    if ((rule.mode != PrivateMode::FromSending && rule.mode != PrivateMode::FromReading) || !allowed_timer(rule.timer_seconds))
+        throw std::runtime_error("That timer is not one of the allowed ones");
+    Bytes p;
+    write_u32(p, static_cast<uint32_t>(rule.mode));
+    write_u32(p, rule.timer_seconds);
+    return p;
+}
+
+std::optional<PrivateRule> parse_private_start_payload(const Bytes& payload) {
+    size_t off = 0;
+    auto mode = read_u32(payload.data(), payload.size(), off);
+    auto timer = read_u32(payload.data(), payload.size(), off);
+    if (!mode || !timer || off != payload.size() || (*mode != 1 && *mode != 2) || !allowed_timer(*timer)) return std::nullopt;
+    return PrivateRule{static_cast<PrivateMode>(*mode), *timer};
+}
+
+Bytes retract_payload(const Bytes& message_id) {
+    if (message_id.size() != ID_BYTES) throw std::runtime_error("That message ID is not valid");
+    Bytes p;
+    write_blob(p, message_id);
+    return p;
+}
+
+std::optional<Bytes> parse_retract_payload(const Bytes& payload) {
+    size_t off = 0;
+    auto id = read_blob(payload.data(), payload.size(), off, ID_BYTES);
+    if (!id || id->size() != ID_BYTES || off != payload.size()) return std::nullopt;
+    return id;
 }
 
 Bytes attachment_payload(const AttachmentInfo& a) {

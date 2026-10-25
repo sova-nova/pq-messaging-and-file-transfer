@@ -45,6 +45,8 @@ enum class RecordType : uint32_t {
     DeleteRequest = 8, // payload: see delete_request_payload(); "let's delete this chat, or these entries" (version 2 only)
     DeleteAccept = 9,  // payload: see delete_accept_payload(); one member's agreement, with their archive key's signature (version 2 only)
     Attachment = 10,   // payload: see attachment_payload(); a message that carries a file (version 2 only)
+    PrivateStart = 11, // payload: see private_start_payload(); starts a Private chat with its rule (version 2 only, outside the transcript)
+    Retract = 12,      // payload: see retract_payload(); takes back an unread message in a Private chat (version 2 only, outside the transcript)
 };
 
 enum class ReceiptKind : uint8_t { Delivered = 1, Read = 2 };
@@ -175,6 +177,30 @@ struct CheckpointInfo {
 // Throws std::runtime_error if the number is 0 or the hash isn't HASH_BYTES.
 Bytes checkpoint_payload(uint64_t number, const Bytes& hash);
 std::optional<CheckpointInfo> parse_checkpoint_payload(const Bytes& payload);
+
+// --- Private chats (M7) ---
+//
+// A Private chat is its own conversation, with a random ID chosen by whoever starts it, separate from the Saved chat with the
+// same person. It begins with a PrivateStart record carrying its rule, which is fixed for the chat's life: how long messages
+// last, and whether that counts from sending or from reading. Messages in it are ordinary text and attachment records under
+// that conversation ID; their expiry comes from the chat's rule. A Retract record names an unread message to take back.
+//
+//   private start payload = u32 mode (1 from sending, 2 from reading) | u32 timer seconds (one of PRIVATE_TIMERS)
+//   retract payload       = blob message_id (ID_BYTES)
+enum class PrivateMode : uint32_t { FromSending = 1, FromReading = 2 };
+constexpr uint32_t PRIVATE_TIMERS[] = {3600, 86400, 7 * 86400, 30 * 86400};  // 1 hour, 1 day, 7 days, 30 days
+constexpr int64_t PRIVATE_UNREAD_LIMIT_SECONDS = 30 * 86400;  // an unread message in a from-reading chat goes 30 days after sending
+constexpr int64_t PRIVATE_MAX_FUTURE_SECONDS = 300;           // a message dated more than 5 minutes ahead is dropped
+constexpr size_t MAX_PRIVATE_START_PAYLOAD = 8;
+constexpr size_t MAX_RETRACT_PAYLOAD = 4 + 16;
+struct PrivateRule {
+    PrivateMode mode = PrivateMode::FromSending;
+    uint32_t timer_seconds = 0;
+};
+Bytes private_start_payload(const PrivateRule& rule);  // throws std::runtime_error for a mode or timer that isn't allowed
+std::optional<PrivateRule> parse_private_start_payload(const Bytes& payload);
+Bytes retract_payload(const Bytes& message_id);
+std::optional<Bytes> parse_retract_payload(const Bytes& payload);
 
 // --- Attachments ---
 //

@@ -82,7 +82,10 @@ public:
     // `token_hash` records which send token was used, so the owner can later tell which card a
     // deposit came through.
     DepositResult deposit(const Bytes& mailbox_id, const Bytes& envelope_id, const Bytes& envelope,
-                          const Bytes& token_hash, int64_t now, uint32_t ttl_seconds, size_t quota_bytes);
+                          const Bytes& token_hash, int64_t now, uint32_t ttl_seconds, size_t quota_bytes, const Bytes& revoke_hash = Bytes());
+    // Deletes a waiting envelope deposited with `revoke_hash` (the hash of the sender's secret). False if there is no such envelope
+    // in that mailbox, it had no revocation hash, or the hash doesn't match.
+    bool revoke(const Bytes& mailbox_id, const Bytes& envelope_id, const Bytes& revoke_hash);
 
     struct Stored {
         int64_t seq = 0;  // arrival order within the relay; only used to page through a mailbox

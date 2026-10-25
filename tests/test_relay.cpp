@@ -794,6 +794,32 @@ static void test_real_relay() {
         keyring.stop();
     }
 
+    std::cout << "12h. Taking back an envelope that is still waiting\n";
+    {
+        const int rbase = 54000 + static_cast<int>(getpid() % 400) * 2;
+        Server rv{rbase, ROOT / "relay-revoke", {}};
+        if (!rv.start()) { std::cout << "FAIL could not start the revocation relay\n"; failures++; return; }
+        auto rinvite = rv.invite();
+        const Bytes rpin = rinvite->relay_id;
+        auto box = make_box(rv, rpin);
+        if (!box) { std::cout << "FAIL setup\n"; failures++; return; }
+        RelayClient c;
+        std::string e;
+        const Bytes secret = CryptoEngine::random_bytes(32);
+        Bytes envelope_id, plain_id;
+        CHECK(connect_to(c, rv, rpin, e) && c.deposit_revocable(box->id, box->token, CryptoEngine::random_bytes(1200), 3600, CryptoEngine::sha256(secret), &envelope_id, e) &&
+                  c.deposit(box->id, box->token, CryptoEngine::random_bytes(1200), 3600, &plain_id, e),
+              "a sender deposits one envelope it can take back, and one it can't (" + e + ")");
+        std::string wrong;
+        CHECK(!c.revoke(box->id, envelope_id, CryptoEngine::random_bytes(32), wrong) && has(wrong, "No such message"), "a wrong secret is refused: " + wrong);
+        std::string missing;
+        CHECK(!c.revoke(box->id, CryptoEngine::random_bytes(16), secret, missing) && missing == wrong, "and an envelope that isn't there gets the very same answer");
+        CHECK(!c.revoke(box->id, plain_id, secret, e), "an envelope deposited without a revocation hash can't be taken back");
+        CHECK(c.revoke(box->id, envelope_id, secret, e), "with its secret, the sender takes the envelope back, with no sign-in (" + e + ")");
+        CHECK(!c.revoke(box->id, envelope_id, secret, e), "once");
+        rv.stop();
+    }
+
     std::cout << "12g. Prekeys\n";
     {
         const int pbase = 55000 + static_cast<int>(getpid() % 400) * 2;

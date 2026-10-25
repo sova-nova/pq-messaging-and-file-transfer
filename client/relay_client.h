@@ -73,6 +73,12 @@ public:
     // Needs sign-in. Cancels one of your unused invites, named by the hash the list gave.
     bool cancel_invite(const std::vector<uint8_t>& invite_hash, std::string& error);
 
+    // A deposit the sender can take back while it is still waiting: `revoke_hash` is the hash of a secret only the sender keeps.
+    bool deposit_revocable(const std::vector<uint8_t>& mailbox_id, const std::vector<uint8_t>& send_token, const std::vector<uint8_t>& envelope, uint32_t ttl_seconds,
+                           const std::vector<uint8_t>& revoke_hash, std::vector<uint8_t>* envelope_id, std::string& error);
+    // Takes it back. Needs no sign-in: the secret is the permission.
+    bool revoke(const std::vector<uint8_t>& mailbox_id, const std::vector<uint8_t>& envelope_id, const std::vector<uint8_t>& secret, std::string& error);
+
     // --- Prekeys (see relay_protocol.h) ---
     // Needs a mailbox sign-in. On success `status` (if given) says what the relay now holds.
     bool put_prekeys(const relay::PrekeyPut& put, relay::PrekeyStatus* status, std::string& error);

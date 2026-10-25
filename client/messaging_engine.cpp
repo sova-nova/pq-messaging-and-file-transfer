@@ -79,6 +79,13 @@ MessagingEngine::MessagingEngine(KeyStore& keys, const fs::path& history_path, c
         prekey_store_path_ = history_path.parent_path() / (history_path.stem().string() + "-prekeys.db");
         prekeys_ = std::make_unique<PrekeyVault>(prekey_store_path_, vault_key);
     }
+    // Private chats: their own store, never the history, never in any backup.
+    {
+        Bytes private_key = keys_.derive_local_key("private store key");
+        auto wipe_private_key = make_scope_exit([&] { CryptoEngine::secure_wipe(private_key); });
+        private_store_path_ = history_path.parent_path() / (history_path.stem().string() + "-private.db");
+        private_ = std::make_unique<PrivateStore>(private_store_path_, private_key);
+    }
     // The first look for chats that need an archive comes one interval after start, not at once: starting up
     // has enough to do already.
     next_archive_check_ = std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, options_.archive_check_seconds));
@@ -598,6 +605,8 @@ bool MessagingEngine::handle_record(const KeyStore::Contact& contact, const chat
     auto their_fp = hex_to_bytes(contact.fingerprint);
     if (!their_fp || their_fp->size() != 32 || sr.record.sender != *their_fp) return false;
 
+    // A Private chat with them, or the start of one.
+    if (sr.record.type == chat::RecordType::PrivateStart || private_->chat(sr.record.conversation_id)) return handle_private_record(contact, *their_fp, sr);
     // Not our one-to-one conversation with them: it may belong to a group we are both in.
     const Bytes conv_id = chat::conversation_id_for(my_fp_, *their_fp);
     if (sr.record.conversation_id != conv_id) return handle_group_record(peer_from_contact(contact), sr, delayed_receipt);
@@ -645,6 +654,9 @@ bool MessagingEngine::handle_record(const KeyStore::Contact& contact, const chat
             return receive_deletion_request(peer_from_contact(contact), sr);
         case chat::RecordType::DeleteAccept:
             return receive_deletion_accept(peer_from_contact(contact), sr);
+        case chat::RecordType::PrivateStart:  // Private chats: handled from M7 step 3
+        case chat::RecordType::Retract:
+            return false;
         case chat::RecordType::Checkpoint:  // these live only in an archive, never in an envelope
         case chat::RecordType::Conversation:
         case chat::RecordType::Forward:
@@ -1200,6 +1212,9 @@ bool MessagingEngine::handle_group_record(const Peer& sender, const chat::Signed
                 return receive_deletion_request(sender, sr);
             case chat::RecordType::DeleteAccept:
                 return receive_deletion_accept(sender, sr);
+            case chat::RecordType::PrivateStart:   // Private chats are one to one only
+            case chat::RecordType::Retract:
+                return false;
             case chat::RecordType::Checkpoint:     // only ever found in an archive
             case chat::RecordType::Conversation:   // the group already exists: a replay changes nothing
                 return false;
@@ -2412,6 +2427,259 @@ void MessagingEngine::check_deletions() {
     }
 }
 
+// --- Private chats ---
+
+int64_t MessagingEngine::private_now() const { return unix_now() + options_.private_clock_offset_seconds; }
+
+bool MessagingEngine::queue_private_record(const PrivateStore::Chat& chat, chat::RecordType type, const Bytes& payload, Bytes* message_id, std::string& error) {
+    auto their_fp = hex_to_bytes(chat.contact_fp);
+    if (!their_fp || their_fp->size() != 32) { error = "That contact isn't valid"; return false; }
+    chat::Record r;
+    r.conversation_id = chat.id;
+    r.message_id = CryptoEngine::random_bytes(chat::ID_BYTES);
+    r.sender = my_fp_;
+    r.recipients_hash = chat::recipients_hash_for({my_fp_, *their_fp});
+    r.sent_at = static_cast<uint64_t>(private_now());
+    r.type = type;
+    r.payload = payload;
+    Bytes raw;
+    try {
+        raw = chat::sign_record(r, dsa_private_);
+    } catch (const std::exception& e) {
+        error = e.what();
+        return false;
+    }
+    if (type == chat::RecordType::Text) {
+        PrivateStore::Message m;
+        m.conversation_id = chat.id;
+        m.message_id = r.message_id;
+        m.outgoing = true;
+        m.sent_at = static_cast<int64_t>(r.sent_at);
+        m.received_at = m.sent_at;
+        // From sending: it goes one timer after sending. From reading: when they read it (we hear by receipt), or, unread, after 30 days.
+        m.expires_at = m.sent_at + (chat.mode == PrivateStore::FromSending ? chat.timer : chat::PRIVATE_UNREAD_LIMIT_SECONDS);
+        m.record = raw;
+        m.status = HistoryStore::Queued;
+        private_->add_message(m);
+    }
+    const int64_t now = unix_now();
+    history_->enqueue(chat.contact_fp, OUTBOX_KIND_MESSAGE, r.message_id, {raw}, now, now);
+    if (message_id) *message_id = r.message_id;
+    bump();
+    return true;
+}
+
+bool MessagingEngine::start_private_chat(const std::string& contact_fp, int mode, int64_t timer_seconds, std::string& chat_id, std::string& error) {
+    auto contact = keys_.find_contact_by_fingerprint(contact_fp);
+    if (!contact) { error = "That contact isn't in your list"; return false; }
+    if (!contact->kem_verified) { error = "Their encryption key isn't verified. Ask them for a new contact card."; return false; }
+    if (!contact->can_message()) { error = "You don't have their messaging address yet. Ask them for a new contact card."; return false; }
+    Bytes payload;
+    try {
+        payload = chat::private_start_payload(chat::PrivateRule{static_cast<chat::PrivateMode>(mode), static_cast<uint32_t>(timer_seconds)});
+    } catch (const std::exception&) {
+        error = "Choose how long messages last (1 hour, 1 day, 7 days or 30 days), and whether that counts from sending or from reading";
+        return false;
+    }
+    PrivateStore::Chat c;
+    c.id = CryptoEngine::random_bytes(chat::ID_BYTES);
+    c.contact_fp = contact_fp;
+    c.mode = mode;
+    c.timer = timer_seconds;
+    c.created_at = private_now();
+    c.started_by_me = true;
+    if (!private_->add_chat(c)) { error = "Could not start the chat"; return false; }
+    if (!queue_private_record(c, chat::RecordType::PrivateStart, payload, nullptr, error)) {
+        private_->erase_chat(c.id);
+        return false;
+    }
+    chat_id = bytes_to_hex(c.id);
+    return true;
+}
+
+bool MessagingEngine::handle_private_record(const KeyStore::Contact& contact, const Bytes& their_fp, const chat::SignedRecord& sr) {
+    if (sr.record.recipients_hash != chat::recipients_hash_for({my_fp_, their_fp})) return false;  // for exactly us two
+    const int64_t now = private_now();
+    const int64_t sent = static_cast<int64_t>(sr.record.sent_at);
+    if (sent > now + chat::PRIVATE_MAX_FUTURE_SECONDS) return false;  // dated more than 5 minutes ahead: dropped
+    if (sr.record.type == chat::RecordType::PrivateStart) {
+        auto rule = chat::parse_private_start_payload(sr.record.payload);
+        if (!rule || sr.record.conversation_id.size() != chat::ID_BYTES) return false;
+        // A chat's rule never changes: the same ID again (a replay) is ignored, and an ID already used for anything else is refused.
+        if (private_->chat(sr.record.conversation_id) || history_->conversation(sr.record.conversation_id)) return false;
+        PrivateStore::Chat c;
+        c.id = sr.record.conversation_id;
+        c.contact_fp = contact.fingerprint;
+        c.mode = static_cast<int>(rule->mode);
+        c.timer = rule->timer_seconds;
+        c.created_at = sent;
+        c.started_by_me = false;
+        private_->add_chat(c);
+        bump();
+        return true;
+    }
+    auto chat = private_->chat(sr.record.conversation_id);
+    if (!chat || chat->contact_fp != contact.fingerprint) return false;
+    const int64_t limit = chat->mode == PrivateStore::FromSending ? chat->timer : chat::PRIVATE_UNREAD_LIMIT_SECONDS;
+    if (sent + limit <= now || sent < chat->created_at - chat::PRIVATE_MAX_FUTURE_SECONDS) return false;  // outside the chat's window: dropped
+    std::string err;
+    switch (sr.record.type) {
+        case chat::RecordType::Text: {
+            PrivateStore::Message m;
+            m.conversation_id = chat->id;
+            m.message_id = sr.record.message_id;
+            m.outgoing = false;
+            m.sent_at = sent;
+            m.received_at = now;
+            m.expires_at = sent + limit;  // from reading: replaced by one timer after it is first shown
+            m.record = sr.raw;
+            if (!private_->add_message(m)) return false;  // a replay
+            queue_private_record(*chat, chat::RecordType::Receipt, chat::receipt_payload(chat::ReceiptKind::Delivered, {m.message_id}), nullptr, err);
+            bump();
+            return true;
+        }
+        case chat::RecordType::Receipt: {
+            auto info = chat::parse_receipt_payload(sr.record.payload);
+            if (!info) return false;
+            for (const auto& id : info->message_ids) {
+                auto m = private_->message(chat->id, id);
+                if (!m || !m->outgoing) continue;
+                const int status = info->kind == chat::ReceiptKind::Read ? HistoryStore::Read : HistoryStore::Delivered;
+                if (status > m->status) private_->set_status(chat->id, id, status);
+                // From reading: our copy goes one timer after they read it.
+                if (info->kind == chat::ReceiptKind::Read && chat->mode == PrivateStore::FromReading && m->status < HistoryStore::Read)
+                    private_->set_expires(chat->id, id, now + chat->timer);
+            }
+            bump();
+            return true;
+        }
+        case chat::RecordType::Retract: {
+            auto id = chat::parse_retract_payload(sr.record.payload);
+            if (!id) return false;
+            // Only a message of theirs that hasn't been shown here yet: once seen, a retraction can't reach it.
+            auto m = private_->message(chat->id, *id);
+            if (m && !m->outgoing && !m->displayed_at) private_->erase_message(chat->id, *id);
+            bump();
+            return true;
+        }
+        default:
+            return false;  // nothing else belongs in a Private chat (attachments in Private chats are not supported yet)
+    }
+}
+
+std::vector<MessagingEngine::PrivateChatSummary> MessagingEngine::private_chats() {
+    std::vector<PrivateChatSummary> out;
+    for (const auto& c : private_->chats()) {
+        PrivateChatSummary s;
+        s.id = bytes_to_hex(c.id);
+        s.contact_fp = c.contact_fp;
+        auto contact = keys_.find_contact_by_fingerprint(c.contact_fp);
+        s.contact_name = contact ? contact->name : c.contact_fp.substr(0, 12);
+        s.mode = c.mode;
+        s.timer = c.timer;
+        s.created_at = c.created_at;
+        s.started_by_me = c.started_by_me;
+        for (const auto& m : private_->messages(c.id))
+            if (!m.outgoing && !m.displayed_at) s.unread++;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+std::vector<MessagingEngine::PrivateMessage> MessagingEngine::private_messages(const std::string& chat_id) {
+    std::vector<PrivateMessage> out;
+    auto id = hex_to_bytes(chat_id);
+    if (!id) return out;
+    const int64_t now = private_now();
+    for (const auto& m : private_->messages(*id)) {
+        if (m.expires_at && *m.expires_at <= now) continue;  // its time is up (the sweep will erase it)
+        auto parsed = chat::parse_record(m.record);
+        if (!parsed || parsed->record.type != chat::RecordType::Text) continue;
+        PrivateMessage pm;
+        pm.id = bytes_to_hex(m.message_id);
+        pm.outgoing = m.outgoing;
+        pm.text.assign(parsed->record.payload.begin(), parsed->record.payload.end());
+        pm.sent_at = m.sent_at;
+        pm.expires_at = m.expires_at;
+        pm.status = m.status;
+        pm.read = m.outgoing ? m.status >= HistoryStore::Read : m.displayed_at.has_value();
+        out.push_back(std::move(pm));
+    }
+    return out;
+}
+
+void MessagingEngine::mark_private_read(const std::string& chat_id) {
+    auto id = hex_to_bytes(chat_id);
+    auto chat = id ? private_->chat(*id) : std::nullopt;
+    if (!chat) return;
+    const int64_t now = private_now();
+    std::vector<Bytes> shown;
+    for (const auto& m : private_->messages(chat->id)) {
+        if (m.outgoing || m.displayed_at) continue;
+        // From reading: it now goes one timer from this moment. From sending: its expiry doesn't change.
+        private_->set_displayed(chat->id, m.message_id, now, chat->mode == PrivateStore::FromReading ? std::optional<int64_t>(now + chat->timer) : m.expires_at);
+        shown.push_back(m.message_id);
+    }
+    if (shown.empty()) return;
+    std::string err;
+    queue_private_record(*chat, chat::RecordType::Receipt, chat::receipt_payload(chat::ReceiptKind::Read, shown), nullptr, err);
+    bump();
+}
+
+bool MessagingEngine::send_private_text(const std::string& chat_id, const std::string& text, std::string& error) {
+    auto id = hex_to_bytes(chat_id);
+    auto chat = id ? private_->chat(*id) : std::nullopt;
+    if (!chat) { error = "That Private chat isn't here any more"; return false; }
+    if (text.empty()) { error = "Nothing to send"; return false; }
+    if (text.size() > chat::MAX_TEXT_BYTES) { error = "That message is too long"; return false; }
+    return queue_private_record(*chat, chat::RecordType::Text, Bytes(text.begin(), text.end()), nullptr, error);
+}
+
+bool MessagingEngine::retract_private_message(const std::string& chat_id, const std::string& message_id, std::string& error) {
+    auto cid = hex_to_bytes(chat_id);
+    auto mid = hex_to_bytes(message_id);
+    auto chat = cid ? private_->chat(*cid) : std::nullopt;
+    auto m = (chat && mid) ? private_->message(*cid, *mid) : std::nullopt;
+    if (!m || !m->outgoing) { error = "That isn't a message you sent"; return false; }
+    if (m->status >= HistoryStore::Read) { error = "They have already read it, so it can't be taken back"; return false; }
+    // From the relay, if it is still waiting there.
+    auto contact = keys_.find_contact_by_fingerprint(chat->contact_fp);
+    for (const auto& r : private_->revocations(*cid, *mid)) {
+        auto address = contact ? parse_server_address(contact->relay_address) : std::nullopt;
+        RelayClient c;
+        std::string e;
+        if (address && c.connect(address->host, address->port, contact->relay_id, options_.connect_timeout_seconds, e)) c.revoke(r.mailbox_id, r.envelope_id, r.secret, e);
+    }
+    // From their device, if it reached it and they haven't seen it.
+    if (!queue_private_record(*chat, chat::RecordType::Retract, chat::retract_payload(*mid), nullptr, error)) return false;
+    private_->erase_message(*cid, *mid);
+    bump();
+    return true;
+}
+
+bool MessagingEngine::delete_private_message(const std::string& chat_id, const std::string& message_id) {
+    auto cid = hex_to_bytes(chat_id);
+    auto mid = hex_to_bytes(message_id);
+    if (!cid || !mid || !private_->erase_message(*cid, *mid)) return false;
+    bump();
+    return true;
+}
+
+bool MessagingEngine::delete_private_chat(const std::string& chat_id) {
+    auto cid = hex_to_bytes(chat_id);
+    if (!cid || !private_->chat(*cid)) return false;
+    private_->erase_chat(*cid);
+    bump();
+    return true;
+}
+
+void MessagingEngine::expire_private() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_private_expiry_) return;
+    next_private_expiry_ = now + std::chrono::seconds(2);
+    if (private_->expire(private_now()) > 0) bump();
+}
+
 // --- Prekeys ---
 
 // Keeps this device's pool of one-time prekeys on its relay: the first set at setup, topped up when it runs low, a new
@@ -3122,7 +3390,31 @@ void MessagingEngine::flush_outbox() {
                 ok = depositor.connected();
                 if (ok) {
                     Bytes envelope = chat::seal_envelope(inner, peer->pub_kem, one_time ? &*one_time : nullptr);
-                    ok = depositor.deposit(peer->mailbox_id, peer->send_token, envelope, options_.envelope_ttl_seconds, nullptr, err);
+                    auto private_chat = private_->chat(item_conv);
+                    if (!private_chat) {
+                        ok = depositor.deposit(peer->mailbox_id, peer->send_token, envelope, options_.envelope_ttl_seconds, nullptr, err);
+                    } else {
+                        // A Private chat's envelope never outlives the message, and can be taken back while it waits.
+                        int64_t sent = private_now();
+                        for (const auto& raw : records)
+                            if (auto parsed = chat::parse_record(raw)) { sent = static_cast<int64_t>(parsed->record.sent_at); break; }
+                        const int64_t limit = private_chat->mode == PrivateStore::FromSending ? private_chat->timer : chat::PRIVATE_UNREAD_LIMIT_SECONDS;
+                        const int64_t left = sent + limit - private_now();
+                        if (left <= 0) {  // its time ran out before it could be delivered: it never will be
+                            history_->outbox_done(item.id);
+                            continue;
+                        }
+                        const Bytes secret = CryptoEngine::random_bytes(32);
+                        Bytes envelope_id;
+                        ok = depositor.deposit_revocable(peer->mailbox_id, peer->send_token, envelope,
+                                                         static_cast<uint32_t>(std::min<int64_t>(left, options_.envelope_ttl_seconds)), CryptoEngine::sha256(secret), &envelope_id, err);
+                        if (ok) {
+                            private_->add_revocation(item_conv, item.message_id, {peer->mailbox_id, envelope_id, secret});
+                            if (auto m = private_->message(item_conv, item.message_id); m && m->outgoing && m->status < HistoryStore::Sent)
+                                private_->set_status(item_conv, item.message_id, HistoryStore::Sent);
+                            bump();
+                        }
+                    }
                 }
             }
             if (!ok) {
@@ -3245,5 +3537,6 @@ void MessagingEngine::pump(int wait_ms) {
         check_attachments();
         maintain_keyring();
         maintain_prekeys();
+        expire_private();
     }
 }

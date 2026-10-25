@@ -379,7 +379,7 @@ void RelayService::handle_session(socket_t sock, const Bytes& hello_payload, con
 
                     Bytes envelope_id = CryptoEngine::random_bytes(ENVELOPE_ID_BYTES);
                     uint32_t ttl = m->ttl_seconds > MAX_TTL_SECONDS ? MAX_TTL_SECONDS : m->ttl_seconds;
-                    if (store_->deposit(m->mailbox_id, envelope_id, m->envelope, token_hash, now, ttl, limits_.mailbox_quota_bytes) ==
+                    if (store_->deposit(m->mailbox_id, envelope_id, m->envelope, token_hash, now, ttl, limits_.mailbox_quota_bytes, m->revoke_hash) ==
                         RelayStore::DepositResult::MailboxFull) {
                         send_error(sock, "Mailbox is full");
                         break;
@@ -564,6 +564,15 @@ void RelayService::handle_session(socket_t sock, const Bytes& hello_payload, con
                     auto info = store_->archive_info(archive_id, now);
                     if (!info) { send_error(sock, "Unknown archive"); break; }
                     if (!send_message(sock, MessageType::ARCHIVE_FETCH_END, encode(ArchiveHead{info->head.number, info->head.hash}))) return;
+                    break;
+                }
+
+                case MessageType::RELAY_REVOKE: {
+                    auto m = decode_revoke(msg->payload);
+                    if (!m) { send_error(sock, "Malformed request"); return; }
+                    if (!rate_.allow("dep-ip:" + peer_ip, limits_.rate_limit_per_minute, now)) { send_error(sock, "Too many requests, slow down"); break; }
+                    if (!store_->revoke(m->mailbox_id, m->envelope_id, CryptoEngine::sha256(m->secret))) { send_error(sock, "No such message, or it was already collected"); break; }
+                    if (!send_message(sock, MessageType::RELAY_REVOKE_OK, {})) return;
                     break;
                 }
 

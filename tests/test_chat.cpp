@@ -5,6 +5,7 @@
 #include "messaging_engine.h"
 #include "prekey.h"
 #include "prekey_vault.h"
+#include "private_store.h"
 #include "envelope.h"
 #include <sqlite3.h>
 #include "message_record.h"
@@ -45,6 +46,8 @@ static std::string SERVER_BIN;
 static fs::path ROOT;
 
 // --- The relay under test ---
+
+static int64_t g_private_offset = 0;  // the test-only clock offset for Private chats (see MessagingEngine::Options)
 
 struct Server {
     int port = 0;
@@ -87,7 +90,8 @@ struct Server {
 
 static MessagingEngine::Options test_options() {
     MessagingEngine::Options o;
-    o.prekey_check_seconds = 1;           // tests don't wait a minute for the pool
+    o.prekey_check_seconds = 1;
+    o.private_clock_offset_seconds = g_private_offset;           // tests don't wait a minute for the pool
     o.last_resort_rotate_seconds = 5;     // nor a week for a new last-resort prekey
     o.receipt_delay_max_seconds = 0;
     o.reconnect_min_seconds = 1;
@@ -724,6 +728,114 @@ int main(int argc, char** argv) {
               "an envelope Bob has already handled is put in his mailbox again (" + rerr + ")");
         run_for(4000);
         CHECK(texts(bob, alice.fp).size() == shown, "it can't be opened (its one-time key is gone) and changes nothing: replays are harmless");
+    }
+
+    std::cout << "11d. Private chats\n";
+    {
+        std::string err, x;
+        auto pchat = [&](User& u, const std::string& id) -> std::optional<MessagingEngine::PrivateChatSummary> {
+            for (auto& c : u.engine->private_chats()) if (c.id == id) return c;
+            return std::nullopt;
+        };
+        auto pmsg = [&](User& u, const std::string& id, const std::string& text) -> std::optional<MessagingEngine::PrivateMessage> {
+            for (auto& m : u.engine->private_messages(id)) if (m.text == text) return m;
+            return std::nullopt;
+        };
+        auto saved_has = [&](User& u, const std::string& from, const std::string& text) { for (auto& m : u.engine->messages(from)) if (m.text == text) return true; return false; };
+        auto restart_both = [&](int64_t offset) {
+            g_private_offset = offset;
+            alice.engine.reset();
+            bob.engine.reset();
+            restart_engine(alice);
+            restart_engine(bob);
+        };
+        const int64_t now0 = static_cast<int64_t>(time(nullptr));
+
+        // --- From sending, 1 hour ---
+        std::string chat1;
+        CHECK(!alice.engine->start_private_chat(bob.fp, 1, 3599, x, err) && !alice.engine->start_private_chat(bob.fp, 3, 3600, x, err) && !alice.engine->start_private_chat(bob.fp, 2, 0, x, err),
+              "only the allowed rules can be chosen (1 hour, 1 day, 7 days or 30 days; from sending or from reading): " + err);
+        CHECK(alice.engine->start_private_chat(bob.fp, 1, 3600, chat1, err), "Alice starts a Private chat with Bob: messages last 1 hour from sending (" + err + ")");
+        CHECK(wait_for([&] { auto c = pchat(bob, chat1); return c && c->mode == 1 && c->timer == 3600 && !c->started_by_me && c->contact_fp == alice.fp; }, 30000), "Bob's app learns of it, with its rule");
+        CHECK(alice.engine->send_private_text(chat1, "for one hour", err) && wait_for([&] { return pmsg(bob, chat1, "for one hour").has_value(); }, 30000), "a message in it reaches Bob");
+        run_for(1500);
+        CHECK(!saved_has(bob, alice.fp, "for one hour") && !saved_has(alice, bob.fp, "for one hour"), "it is not in the Saved chat on either side");
+        auto m1 = pmsg(bob, chat1, "for one hour");
+        CHECK(m1 && m1->expires_at && *m1->expires_at == m1->sent_at + 3600 && !m1->read, "on Bob's side it goes one hour after it was sent");
+        CHECK(wait_for([&] { auto m = pmsg(alice, chat1, "for one hour"); return m && m->status >= HistoryStore::Delivered; }, 30000), "Alice sees it delivered");
+        bob.engine->mark_private_read(chat1);
+        CHECK(wait_for([&] { auto m = pmsg(alice, chat1, "for one hour"); return m && m->status == HistoryStore::Read; }, 30000) && pmsg(bob, chat1, "for one hour")->read, "Bob reads it, and Alice sees that");
+        restart_both(3601);
+        CHECK(wait_for([&] { return !pmsg(bob, chat1, "for one hour") && !pmsg(alice, chat1, "for one hour"); }, 20000), "an hour later (both clocks moved on), it is gone from both devices");
+        {   // Not just hidden: erased from the store (the app hides an expired message at once; the sweep erases it within seconds).
+            run_for(3000);
+            as(bob);
+            PrivateStore store(bob.engine->private_store_path(), bob.keys->derive_local_key("private store key"));
+            bool still_there = false;
+            for (auto& m : store.messages(*hex_to_bytes(chat1))) still_there |= std::string(m.record.begin(), m.record.end()).find("for one hour") != std::string::npos;
+            CHECK(!still_there, "and erased from Bob's private store, not just hidden");
+        }
+        CHECK(pchat(bob, chat1) && pchat(alice, chat1), "(the chat itself stays, empty)");
+        restart_both(0);
+
+        // --- From reading, 1 day ---
+        std::string chat2;
+        CHECK(alice.engine->start_private_chat(bob.fp, 2, 86400, chat2, err) && wait_for([&] { return pchat(bob, chat2).has_value(); }, 30000), "Alice starts another, where messages last 1 day from reading");
+        CHECK(alice.engine->send_private_text(chat2, "read me later", err) && wait_for([&] { return pmsg(bob, chat2, "read me later").has_value(); }, 30000), "a message reaches Bob");
+        auto unread = pmsg(bob, chat2, "read me later");
+        CHECK(unread && unread->expires_at && *unread->expires_at == unread->sent_at + 30 * 86400 && pchat(bob, chat2)->unread == 1, "unread, Bob's copy would go 30 days after sending");
+        bob.engine->mark_private_read(chat2);
+        const int64_t read_at = static_cast<int64_t>(time(nullptr));
+        auto read_copy = pmsg(bob, chat2, "read me later");
+        CHECK(read_copy && read_copy->read && read_copy->expires_at && *read_copy->expires_at >= read_at + 86400 - 5 && *read_copy->expires_at <= read_at + 86400 + 5, "once Bob has seen it, his copy goes one day from then");
+        CHECK(wait_for([&] { auto m = pmsg(alice, chat2, "read me later"); return m && m->status == HistoryStore::Read && m->expires_at && *m->expires_at >= read_at + 86400 - 10 && *m->expires_at <= read_at + 86400 + 30; }, 30000),
+              "and Alice's copy, once she hears he read it, goes one day from then too");
+        restart_both(86400 + 60);
+        CHECK(wait_for([&] { return !pmsg(bob, chat2, "read me later") && !pmsg(alice, chat2, "read me later"); }, 20000), "a day later it is gone from both");
+        restart_both(0);
+
+        // --- Clocks: too far ahead, or outside the chat's window ---
+        std::string chat3;
+        CHECK(alice.engine->start_private_chat(bob.fp, 1, 3600, chat3, err) && wait_for([&] { return pchat(bob, chat3).has_value(); }, 30000), "(a third Private chat, 1 hour from sending)");
+        g_private_offset = 600;
+        alice.engine.reset();
+        restart_engine(alice);
+        alice.engine->send_private_text(chat3, "from ten minutes ahead", err);
+        g_private_offset = -3700;
+        run_for(3000);
+        alice.engine.reset();
+        restart_engine(alice);
+        alice.engine->send_private_text(chat3, "from over an hour ago", err);
+        run_for(4000);
+        g_private_offset = 0;
+        alice.engine.reset();
+        restart_engine(alice);
+        CHECK(alice.engine->send_private_text(chat3, "on time", err) && wait_for([&] { return pmsg(bob, chat3, "on time").has_value(); }, 30000), "(a message with the right time arrives)");
+        CHECK(!pmsg(bob, chat3, "from ten minutes ahead") && !pmsg(bob, chat3, "from over an hour ago"),
+              "one dated more than 5 minutes ahead, and one dated outside the chat's hour, were both dropped");
+
+        // --- Retracting ---
+        bob.engine.reset();
+        CHECK(alice.engine->send_private_text(chat2, "still on the relay", err) && wait_for([&] { auto m = pmsg(alice, chat2, "still on the relay"); return m && m->status >= HistoryStore::Sent; }, 30000),
+              "with Bob's app closed, Alice sends a message, which waits on his relay");
+        auto waiting = pmsg(alice, chat2, "still on the relay");
+        CHECK(waiting && alice.engine->retract_private_message(chat2, waiting->id, err) && !pmsg(alice, chat2, "still on the relay"), "Alice takes it back (" + err + ")");
+        restart_engine(bob);
+        run_for(5000);
+        CHECK(!pmsg(bob, chat2, "still on the relay"), "Bob's app comes back and never sees it: it was taken off the relay");
+        CHECK(alice.engine->send_private_text(chat2, "delivered, not read", err) && wait_for([&] { return pmsg(bob, chat2, "delivered, not read").has_value(); }, 30000), "Alice sends another, which reaches Bob");
+        auto delivered = pmsg(alice, chat2, "delivered, not read");
+        CHECK(delivered && alice.engine->retract_private_message(chat2, delivered->id, err) && wait_for([&] { return !pmsg(bob, chat2, "delivered, not read"); }, 30000),
+              "Bob hasn't looked at it: when Alice takes it back, it goes from his device");
+        CHECK(alice.engine->send_private_text(chat2, "already seen", err) && wait_for([&] { return pmsg(bob, chat2, "already seen").has_value(); }, 30000), "Alice sends a third");
+        bob.engine->mark_private_read(chat2);
+        CHECK(wait_for([&] { auto m = pmsg(alice, chat2, "already seen"); return m && m->status == HistoryStore::Read; }, 30000), "(Bob reads it)");
+        auto seen = pmsg(alice, chat2, "already seen");
+        CHECK(seen && !alice.engine->retract_private_message(chat2, seen->id, err) && err.find("already read") != std::string::npos && pmsg(bob, chat2, "already seen"), "a message he has read can't be taken back: " + err);
+
+        // --- Deleting ---
+        CHECK(bob.engine->delete_private_chat(chat2) && !pchat(bob, chat2) && pchat(alice, chat2), "Bob deletes the chat on his device; Alice's stays");
+        (void)now0;
     }
 
     std::cout << "12. Locked keys\n";
