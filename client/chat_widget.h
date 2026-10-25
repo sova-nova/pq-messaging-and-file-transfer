@@ -51,6 +51,10 @@ private:
     void make_relay_invite();
     void restore_history();
     void attach_file();
+    void render_privates();
+    void render_private_messages(bool force_scroll);
+    void select_private(const QString& chat_id);
+    void start_private_chat();
     void copy_selected_messages();
     void open_details(QListWidgetItem* item);
     void report_unread();
@@ -86,6 +90,7 @@ private:
     QPushButton* requests_button_ = nullptr;
     QPushButton* cards_button_ = nullptr;
     QPushButton* new_group_button_ = nullptr;
+    QPushButton* new_private_button_ = nullptr;  // start a Private (disappearing) chat
     QPushButton* relay_invite_button_ = nullptr;
     QPushButton* restore_button_ = nullptr;
     QPushButton* attach_button_ = nullptr;   // choose a file to send in the chat on screen
@@ -100,6 +105,8 @@ private:
     QListWidget* contacts_ = nullptr;
     QLabel* groups_label_ = nullptr;
     QListWidget* groups_ = nullptr;
+    QLabel* private_label_ = nullptr;
+    QListWidget* privates_ = nullptr;  // Private chats, kept apart from the saved ones
     QLabel* header_label_ = nullptr;
     QCheckBox* delivery_box_ = nullptr;
     QCheckBox* read_box_ = nullptr;
@@ -112,6 +119,7 @@ private:
 
     QString current_fp_;     // the contact being looked at, or empty
     QString current_group_;  // the group being looked at (its ID), or empty. Never both.
+    QString current_private_;  // the Private chat being looked at (its ID), or empty. Only one of the three is ever set.
     uint64_t last_revision_ = 0;
     size_t shown_messages_ = 0;
     bool updating_ui_ = false;

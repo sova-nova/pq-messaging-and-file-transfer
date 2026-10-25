@@ -77,7 +77,7 @@ The assistant's sandbox has **no Qt, no CMake, no real liboqs and no SQLite head
 - **M3 groups** is complete (see "M3: decisions and build order" below). Next is **M4 archive and restore**, which removes the "history only on this device" limit; groups already keep their conversation as signed, hash-chained records, which is what the archive will store.
 - Known limits of M3 worth knowing: membership is fixed at creation (changing a group means making a new one linked to the old); if a group's creator is offline, members who aren't each other's contacts stay "setting up" until it returns; there is no forward secrecy or archive yet (M6, M4); the relay allows 10 mailbox registrations per minute per address.
 
-## M7: Private chats (in progress; steps 1 to 3 of 5 done)
+## M7: Private chats (in progress; steps 1 to 4 of 5 done)
 
 A Private chat is a separate, timed conversation with a contact, next to the Saved chat with them. Its messages disappear on a timer and, with M6's forward secrecy, are then unrecoverable between honest apps. Never archived, never in the keyring, never restored.
 
@@ -94,7 +94,16 @@ Decisions settled with the maintainer:
 | 5 | Copying text is allowed; the chat header notes that copies, screenshots and exported files don't expire. |
 | 6 | GUI: \"New Private chat...\" with a mode and timer picker; the header shows the rule (\"Private · 7 days after reading\") and each message its time left; an **hourglass icon** marks Private chats in the chat list and header; a **one-time explanation** the first time someone starts one (what disappears and when, and what doesn't); Private chats are labelled and kept apart from Saved ones in the list. The maintainer asked that users clearly understand the difference. |
 
-Build order: 1. records and the private store (**done**); 2. relay: envelope lifetimes tied to expiry, the revocation token (**done**); 3. engine (**done**); 4. GUI; 5. end-to-end and hostile tests.
+Build order: 1. records and the private store (**done**); 2. relay: envelope lifetimes tied to expiry, the revocation token (**done**); 3. engine (**done**); 4. GUI (**done**, type-checked only); 5. end-to-end and hostile tests.
+
+**Step 4 as built** (`ChatWidget`; type-checked against the Qt stub, not run here):
+
+- **Kept apart, and marked.** Private chats have their own list under the groups, headed \"⏳ Private chats (disappearing)\", each shown as \"⏳ Name · 1 day after reading\" with its unread count; the hourglass also leads the button and the header. Only one conversation (contact, group or Private chat) is selected at a time.
+- **⏳ New Private chat…** (next to New group…): for the contact on screen, or one chosen from a list. **The first time**, an explanation says what a Private chat is: separate from the saved chat; messages disappear on a timer fixed at the start; once gone they can't be brought back; copies, screenshots and exports don't disappear, and a modified app could keep messages; read receipts are always on; never backed up or restored. It can be cancelled, and is shown once (`QSettings` key `private_chats/explained`). Then the timer's start (sending or reading, reading preselected) and its length (1 hour to 30 days, 1 day preselected), each saying it can't be changed later.
+- **The header** of a Private chat says who with and its rule, then \"Not backed up. Copies, screenshots and anything exported don't disappear. They always see when you've read a message.\" The receipt boxes are disabled (receipts are part of the rule), and so is Attach… (files in Private chats aren't supported yet).
+- **Messages** show their time left (\"⏳ 23h left\", or \"until read\" when not yet known) and, for ours, sent / delivered / read; the list is redrawn every 15 seconds so the times stay right, keeping the scroll position and highlight. Copy works as elsewhere. A Private chat's messages are marked read only while it is on screen and the window active (that starts a from-reading timer).
+- **Right-click** a message: **Take back (they haven't read it)** for ours that are unread, and **Delete from this device**. **Delete chat…** on a Private chat deletes it from this device only, after saying the other person's copy isn't affected.
+- The Chats tab's count includes unread Private messages.
 
 **Step 3 as built** (`MessagingEngine`, `PrivateStore` revocations): Private chats work between people, with no GUI yet.
 

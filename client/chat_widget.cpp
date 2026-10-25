@@ -67,6 +67,20 @@ struct SelectionKeeper {
     }
 };
 
+// How long a Private message has left, in words.
+static QString time_left(int64_t seconds) {
+    if (seconds <= 0) return QString("going now");
+    if (seconds < 3600) return QString::number(static_cast<qulonglong>((seconds + 59) / 60)) + "m left";
+    if (seconds < 86400) return QString::number(static_cast<qulonglong>((seconds + 3599) / 3600)) + "h left";
+    return QString::number(static_cast<qulonglong>((seconds + 86399) / 86400)) + "d left";
+}
+
+// A Private chat's rule, in words: "1 day after reading".
+static QString private_rule(int mode, int64_t timer) {
+    QString length = timer == 3600 ? "1 hour" : timer == 86400 ? "1 day" : timer == 7 * 86400 ? "7 days" : timer == 30 * 86400 ? "30 days" : QString::number(static_cast<qulonglong>(timer)) + " seconds";
+    return length + (mode == 2 ? " after reading" : " after sending");
+}
+
 // "3.1 MB", for telling someone how big a file is before they choose to fetch it.
 static QString human_size(uint64_t bytes) {
     char buf[40];
@@ -172,6 +186,8 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     requests_button_ = new QPushButton("Message requests", this);
     cards_button_ = new QPushButton("Cards issued…", this);
     new_group_button_ = new QPushButton("New group…", this);
+    new_private_button_ = new QPushButton("⏳ New Private chat…", this);
+    new_private_button_->setToolTip("A separate chat with someone where messages disappear on a timer you choose");
     invites_button_ = new QPushButton("Group invitations", this);
     deletions_button_ = new QPushButton("Deletion requests", this);
     deletions_button_->setToolTip("Other people asking to delete a chat, or messages in it, for everyone. It only happens if everyone agrees.");
@@ -183,6 +199,7 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     top->addWidget(invites_button_);
     top->addWidget(deletions_button_);
     top->addWidget(new_group_button_);
+    top->addWidget(new_private_button_);
     top->addWidget(relay_invite_button_);
     restore_button_ = new QPushButton("Restore history…", this);
     restore_button_->setToolTip("After reinstalling: get your saved chats back from the relay");
@@ -206,6 +223,18 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     left->addWidget(groups_, 2);
     groups_label_->setVisible(false);  // shown once there is a group
     groups_->setVisible(false);
+    // Private chats: listed apart from the saved ones, marked with an hourglass, so the two are never confused.
+    private_label_ = new QLabel("⏳ Private chats (disappearing)", this);
+    private_label_->setTextFormat(Qt::PlainText);
+    private_label_->setToolTip("Messages in a Private chat disappear on a timer. They are kept apart from your saved chats, never backed up, and not restored after a reinstall.");
+    privates_ = new QListWidget(this);
+    privates_->setMinimumWidth(170);
+    privates_->setMaximumWidth(230);
+    privates_->setToolTip(private_label_->toolTip());
+    left->addWidget(private_label_);
+    left->addWidget(privates_, 2);
+    private_label_->setVisible(false);  // shown once there is a Private chat
+    privates_->setVisible(false);
     body->addLayout(left);
 
     auto* right = new QVBoxLayout();
@@ -310,6 +339,19 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     connect(contacts_, &QListWidget::currentItemChanged, this, [this](QListWidgetItem* item, QListWidgetItem*) {
         if (!updating_ui_ && item) select_contact(item->data(Qt::UserRole).toString());
     });
+    connect(privates_, &QListWidget::currentItemChanged, this, [this](QListWidgetItem* item, QListWidgetItem*) {
+        if (updating_ui_ || !item) return;
+        select_private(item->data(Qt::UserRole).toString());
+    });
+    connect(new_private_button_, &QPushButton::clicked, this, [this] { start_private_chat(); });
+    auto* private_timer = new QTimer(this);  // a Private chat's "time left" changes as time passes
+    connect(private_timer, &QTimer::timeout, this, [this] {
+        if (current_private_.isEmpty()) return;
+        const int keep = messages_->verticalScrollBar()->value();
+        render_private_messages(false);
+        messages_->verticalScrollBar()->setValue(keep);
+    });
+    private_timer->start(15000);
     connect(groups_, &QListWidget::currentItemChanged, this, [this](QListWidgetItem* item, QListWidgetItem*) {
         if (!updating_ui_ && item) select_group(item->data(Qt::UserRole).toString());
     });
@@ -329,6 +371,12 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
         QAction* copy = menu.addAction("Copy");
         copy->setEnabled(!messages_->selectedItems().isEmpty());
         QAction* all = menu.addAction("Select all");
+        QAction* take_back = nullptr;
+        QAction* delete_mine = nullptr;
+        if (at && !current_private_.isEmpty() && !at->data(Qt::UserRole + 3).toString().isEmpty()) {
+            if (at->data(Qt::UserRole + 4).toInt() == 1) take_back = menu.addAction("Take back (they haven't read it)");
+            delete_mine = menu.addAction("Delete from this device");
+        }
         QAction* details = nullptr;
         if (at && (!at->data(Qt::UserRole + 1).toString().isEmpty() || (!current_group_.isEmpty() && !at->data(Qt::UserRole).toString().isEmpty())))
             details = menu.addAction("Details…");
@@ -337,6 +385,15 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
         if (chosen == copy) copy_selected_messages();
         else if (chosen == all) messages_->selectAll();
         else if (details && chosen == details) open_details(at);
+        else if (take_back && chosen == take_back) {
+            std::string error;
+            if (!engine_->retract_private_message(current_private_.toStdString(), at->data(Qt::UserRole + 3).toString().toStdString(), error))
+                QMessageBox::warning(this, "Take back", qstr(error));
+            refresh();
+        } else if (delete_mine && chosen == delete_mine) {
+            engine_->delete_private_message(current_private_.toStdString(), at->data(Qt::UserRole + 3).toString().toStdString());
+            refresh();
+        }
     });
     connect(delivery_box_, &QCheckBox::toggled, this, [this](bool) { apply_receipt_settings(); });
     connect(read_box_, &QCheckBox::toggled, this, [this](bool) { apply_receipt_settings(); });
@@ -369,6 +426,7 @@ void ChatWidget::refresh() {
     if (!engine_) return;
     render_chats();
     render_groups();
+    render_privates();
     render_messages(true);
     update_header();
     report_unread();
@@ -380,6 +438,7 @@ void ChatWidget::report_unread() {
     size_t total = 0;
     for (const auto& c : engine_->chats()) total += c.unread;
     for (const auto& g : engine_->groups()) total += g.unread;
+    for (const auto& p : engine_->private_chats()) total += p.unread;
     if (total == last_unread_) return;
     last_unread_ = total;
     on_unread_changed_(total);
@@ -474,6 +533,10 @@ void ChatWidget::render_groups() {
 }
 
 void ChatWidget::render_messages(bool force_scroll) {
+    if (!current_private_.isEmpty()) {
+        render_private_messages(force_scroll);
+        return;
+    }
     if (!current_group_.isEmpty()) {
         render_group_messages(force_scroll);
         return;
@@ -563,6 +626,26 @@ void ChatWidget::render_group_messages(bool force_scroll) {
 }
 
 void ChatWidget::update_header() {
+    if (!current_private_.isEmpty()) {
+        // A Private chat: who with, its rule, and what doesn't disappear. Said every time, so it is never mistaken for a saved chat.
+        QString text = "⏳ Private chat";
+        for (const auto& c : engine_->private_chats()) {
+            if (qstr(c.id) != current_private_) continue;
+            text = "⏳ Private chat with " + qstr(c.contact_name) + "  ·  messages disappear " + private_rule(c.mode, c.timer) +
+                   "\nNot backed up. Copies, screenshots and anything exported don't disappear. They always see when you've read a message.";
+        }
+        header_label_->setProperty("contact_name", QString());
+        header_label_->setText(text);
+        delivery_box_->setEnabled(false);  // receipts are part of a Private chat's rule
+        read_box_->setEnabled(false);
+        revoke_button_->setEnabled(false);
+        people_button_->setEnabled(false);
+        delete_chat_button_->setEnabled(true);
+        attach_button_->setEnabled(false);  // files in Private chats aren't supported yet
+        input_->setEnabled(true);
+        send_button_->setEnabled(true);
+        return;
+    }
     if (!current_group_.isEmpty()) {
         // A group: its name, who is in it, and what we are still waiting for.
         const std::string id = current_group_.toStdString();
@@ -750,8 +833,10 @@ void ChatWidget::show_group_delivery(const QString& message_id) {
 void ChatWidget::select_contact(const QString& fingerprint) {
     current_fp_ = fingerprint;
     current_group_.clear();
+    current_private_.clear();
     updating_ui_ = true;
     groups_->setCurrentRow(-1);  // only one conversation is selected at a time
+    privates_->setCurrentRow(-1);
     updating_ui_ = false;
     if (isVisible() && window()->isActiveWindow()) engine_->mark_read(current_fp_.toStdString());
     update_header();
@@ -762,8 +847,10 @@ void ChatWidget::select_contact(const QString& fingerprint) {
 void ChatWidget::select_group(const QString& group_id) {
     current_group_ = group_id;
     current_fp_.clear();
+    current_private_.clear();
     updating_ui_ = true;
     contacts_->setCurrentRow(-1);
+    privates_->setCurrentRow(-1);
     updating_ui_ = false;
     if (isVisible() && window()->isActiveWindow()) engine_->mark_group_read(current_group_.toStdString());
     update_header();
@@ -783,6 +870,19 @@ void ChatWidget::apply_receipt_settings() {
 // --- Actions ---
 
 void ChatWidget::send_current() {
+    if (!current_private_.isEmpty()) {
+        const QString text = input_->text();
+        if (text.trimmed().isEmpty()) return;
+        std::string error;
+        if (!engine_->send_private_text(current_private_.toStdString(), text.toStdString(), error)) {
+            QMessageBox::warning(this, "Can't send", qstr(error));
+            return;
+        }
+        input_->clear();
+        last_revision_ = 0;
+        refresh_if_changed();
+        return;
+    }
     if (current_fp_.isEmpty() && current_group_.isEmpty()) return;
     const QString text = input_->text();
     if (text.trimmed().isEmpty()) return;
@@ -1156,6 +1256,18 @@ void ChatWidget::review_deletions() {
 
 // Ask everyone in the chat on screen to delete it.
 void ChatWidget::request_delete_chat() {
+    if (!current_private_.isEmpty()) {
+        QMessageBox ask(QMessageBox::Question, "Delete Private chat",
+                        "Delete this Private chat from this device?\n\nIts messages are erased here now and can't be brought back. "
+                        "The other person's copy isn't affected: it disappears on its own timer.",
+                        QMessageBox::Yes | QMessageBox::No, this);
+        plain_box(ask);
+        if (ask.exec() != QMessageBox::Yes) return;
+        engine_->delete_private_chat(current_private_.toStdString());
+        current_private_.clear();
+        refresh();
+        return;
+    }
     std::string id;
     if (!current_group_.isEmpty()) {
         id = current_group_.toStdString();
@@ -1211,6 +1323,127 @@ void ChatWidget::open_details(QListWidgetItem* item) {
         return;
     }
     if (!current_group_.isEmpty() && !item->data(Qt::UserRole).toString().isEmpty()) show_group_delivery(item->data(Qt::UserRole).toString());
+}
+
+void ChatWidget::render_privates() {
+    updating_ui_ = true;
+    privates_->clear();
+    int select_row = -1;
+    int row = 0;
+    for (const auto& p : engine_->private_chats()) {
+        QString label = "⏳ " + qstr(p.contact_name) + "  ·  " + private_rule(p.mode, p.timer);
+        if (p.unread) label += QString(" (%1)").arg(static_cast<qulonglong>(p.unread));
+        auto* item = new QListWidgetItem(label);
+        item->setData(Qt::UserRole, qstr(p.id));
+        item->setToolTip("Private chat with " + qstr(p.contact_name) + ": messages disappear " + private_rule(p.mode, p.timer) + ". Started " +
+                         QDateTime::fromSecsSinceEpoch(p.created_at).toString("d MMM yyyy") + (p.started_by_me ? " by you." : " by them."));
+        privates_->addItem(item);
+        if (qstr(p.id) == current_private_) select_row = row;
+        row++;
+    }
+    private_label_->setVisible(row > 0);
+    privates_->setVisible(row > 0);
+    if (select_row >= 0) privates_->setCurrentRow(select_row);
+    updating_ui_ = false;
+}
+
+void ChatWidget::select_private(const QString& chat_id) {
+    current_private_ = chat_id;
+    current_fp_.clear();
+    current_group_.clear();
+    updating_ui_ = true;
+    contacts_->setCurrentRow(-1);
+    groups_->setCurrentRow(-1);
+    updating_ui_ = false;
+    update_header();
+    render_messages(true);
+    input_->setFocus();
+}
+
+void ChatWidget::render_private_messages(bool force_scroll) {
+    const std::string id = current_private_.toStdString();
+    // Seen only while it is on screen: in a from-reading chat this starts each message's timer.
+    if (isVisible() && window()->isActiveWindow()) engine_->mark_private_read(id);
+    QString contact_name;
+    for (const auto& c : engine_->private_chats())
+        if (qstr(c.id) == current_private_) contact_name = qstr(c.contact_name);
+    auto messages = engine_->private_messages(id);
+    const QString scope = "p:" + current_private_;
+    SelectionKeeper keep_selection(messages_, scope == selection_scope_);
+    selection_scope_ = scope;
+    messages_->clear();
+    animating_ = false;
+    const int64_t now = static_cast<int64_t>(QDateTime::currentSecsSinceEpoch());
+    for (const auto& m : messages) {
+        const QString when = QDateTime::fromSecsSinceEpoch(m.sent_at).toString("d MMM HH:mm");
+        const QString who = m.outgoing ? QString("You") : contact_name;
+        QString status;
+        if (m.outgoing) status = m.status >= HistoryStore::Read ? "read" : m.status >= HistoryStore::Delivered ? "delivered" : m.status >= HistoryStore::Sent ? "sent" : "waiting to send";
+        const QString left = m.expires_at ? time_left(*m.expires_at - now) : QString("until read");
+        auto* item = new QListWidgetItem("[" + when + "] " + who + ": " + qstr(m.text) + "   (⏳ " + left + (status.isEmpty() ? QString() : ", " + status) + ")");
+        item->setTextAlignment(m.outgoing ? Qt::AlignRight : Qt::AlignLeft);
+        item->setData(Qt::UserRole + 2, "[" + when + "] " + who + ": " + qstr(m.text));  // what Copy puts on the clipboard
+        item->setData(Qt::UserRole + 3, qstr(m.id));
+        item->setData(Qt::UserRole + 4, (m.outgoing && !m.read) ? 1 : 0);  // can still be taken back
+        item->setToolTip(m.outgoing && !m.read ? "Right-click to take it back: they haven't read it yet" : "Right-click to delete it from this device");
+        messages_->addItem(item);
+    }
+    if (force_scroll) messages_->scrollToBottom();
+}
+
+// Starts a Private chat with the contact on screen (or one chosen from the list). The first time, it says plainly what a Private
+// chat is and isn't, so it is never mistaken for a saved one.
+void ChatWidget::start_private_chat() {
+    std::string fp = current_fp_.toStdString();
+    if (fp.empty()) {
+        QStringList names;
+        std::vector<std::string> fps;
+        for (const auto& c : engine_->chats()) {
+            names << qstr(c.contact_name);
+            fps.push_back(c.contact_fp);
+        }
+        if (fps.empty()) {
+            QMessageBox::information(this, "New Private chat", "Add a contact first.");
+            return;
+        }
+        bool ok = false;
+        const QString chosen = QInputDialog::getItem(this, "New Private chat", "Who with?", names, 0, false, &ok);
+        if (!ok) return;
+        fp = fps[static_cast<size_t>(std::max(0, static_cast<int>(names.indexOf(chosen))))];
+    }
+    QSettings settings;
+    if (!settings.value("private_chats/explained", false).toBool()) {
+        QMessageBox about(QMessageBox::Information, "Private chats",
+                          "A Private chat is a separate chat with someone, apart from your saved chat with them, and marked with ⏳.\n\n"
+                          "Its messages disappear on a timer you choose now and can't change later: 1 hour, 1 day, 7 days or 30 days, counted from "
+                          "when a message is sent or from when it is read. Once a message has gone, it can't be brought back: not from your device, "
+                          "theirs, or the relay.\n\n"
+                          "What doesn't disappear: anything someone copies, screenshots or photographs, or a file they export. A modified app could "
+                          "also keep messages. Use Private chats with people you trust to respect them.\n\n"
+                          "In a Private chat the other person always sees when you've read a message, because reading can be what starts the timer.\n\n"
+                          "Private chats are never backed up, and are not brought back after a reinstall.",
+                          QMessageBox::Ok | QMessageBox::Cancel, this);
+        plain_box(about);
+        if (about.exec() != QMessageBox::Ok) return;
+        settings.setValue("private_chats/explained", true);
+    }
+    bool ok = false;
+    const QStringList starts = {"From when a message is sent", "From when a message is read"};
+    const QString start = QInputDialog::getItem(this, "New Private chat", "When should a message's timer start?\n(This can't be changed later.)", starts, 1, false, &ok);
+    if (!ok) return;
+    const QStringList lengths = {"1 hour", "1 day", "7 days", "30 days"};
+    const QString length = QInputDialog::getItem(this, "New Private chat", "How long should messages last?\n(This can't be changed later.)", lengths, 1, false, &ok);
+    if (!ok) return;
+    const int mode = start == starts[0] ? 1 : 2;
+    const int64_t timer = length == lengths[0] ? 3600 : length == lengths[1] ? 86400 : length == lengths[2] ? 7 * 86400 : 30 * 86400;
+    std::string chat_id, error;
+    if (!engine_->start_private_chat(fp, mode, timer, chat_id, error)) {
+        QMessageBox::warning(this, "New Private chat", qstr(error));
+        return;
+    }
+    refresh();
+    select_private(qstr(chat_id));
+    render_privates();
 }
 
 void ChatWidget::attach_file() {
