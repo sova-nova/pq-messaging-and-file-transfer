@@ -1,10 +1,12 @@
 // Unit tests for the v3 payload codecs and signing inputs: round trips, truncation, trailing
 // bytes, and random mutation (decoders must never crash or accept garbage as something else).
 #include "relay_protocol.h"
+#include "secure_channel.h"
 
 #include "protocol.h"
 #include "sharing.h"
 
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <random>
@@ -271,6 +273,134 @@ int main() {
                   input != archive_delete_signing_input(relay_id, arch, DELETE_SCOPE_ENTRIES, op, 1001, hashes) && input != archive_delete_signing_input(relay_id, arch, DELETE_SCOPE_ENTRIES, op, 1000, {hashes[0]}) &&
                   input != archive_delete_signing_input(relay_id, arch, DELETE_SCOPE_ENTRIES, op, 1000, {hashes[1], hashes[0]}),
               "what each member signs covers the relay, the chat, the scope, the operation, the expiry and the entries in order");
+    }
+
+    std::cout << "The encrypted relay connection\n";
+    {
+        auto contains = [](const Bytes& hay, const std::string& needle) { return std::search(hay.begin(), hay.end(), needle.begin(), needle.end()) != hay.end(); };
+        auto throws = [](const std::function<void()>& f) { try { f(); } catch (const std::exception&) { return true; } return false; };
+        namespace sc = securechannel;
+        const auto relay_identity = CryptoEngine::generate_sig_keypair();
+        const Bytes relay_id = CryptoEngine::sha256(relay_identity.public_key);
+        // One full handshake; returns whether the client accepted, and the keys and messages along the way.
+        struct Run { bool client_ok = false, server_ok = false; sc::Keys ck, sk; Bytes hello, server_hello, finish, got_id; std::string error; };
+        auto run = [&](const Bytes& pinned, const std::function<void(Bytes&)>& tamper_server_hello = nullptr, const std::function<void(Bytes&)>& tamper_finish = nullptr) {
+            Run r;
+            sc::ClientHandshake client;
+            sc::ServerHandshake server(relay_identity);
+            r.hello = client.hello();
+            if (!server.reply(r.hello, r.server_hello)) return r;
+            if (tamper_server_hello) tamper_server_hello(r.server_hello);
+            r.client_ok = client.finish(r.server_hello, pinned, r.finish, r.ck, r.got_id, r.error);
+            if (!r.client_ok) return r;
+            if (tamper_finish) tamper_finish(r.finish);
+            r.server_ok = server.finish(r.finish, r.sk);
+            return r;
+        };
+        auto r = run(relay_id);
+        CHECK(r.client_ok && r.server_ok && r.got_id == relay_id && r.ck.send == r.sk.recv && r.ck.recv == r.sk.send && r.ck.send != r.ck.recv && r.ck.send.size() == 32,
+              "a handshake gives both sides the same two keys, one for each direction, and the relay's ID");
+        auto r2 = run(relay_id);
+        CHECK(r2.client_ok && r2.ck.send != r.ck.send, "every connection gets keys of its own");
+        sc::Cipher client_c(r.ck, true), relay_c(r.sk, false);
+        bool both_ways = true;
+        for (int i = 0; i < 5; i++) {
+            Bytes up = CryptoEngine::random_bytes(100 + i), down = CryptoEngine::random_bytes(50 + i);
+            auto got_up = relay_c.open(client_c.seal(up));
+            auto got_down = client_c.open(relay_c.seal(down));
+            both_ways &= got_up && *got_up == up && got_down && *got_down == down;
+        }
+        CHECK(both_ways, "frames go both ways, in order, intact");
+        const Bytes secret_text = {'s', 'e', 'n', 'd', '-', 't', 'o', 'k', 'e', 'n'};
+        Bytes sealed = client_c.seal(secret_text);
+        CHECK(!contains(sealed, "send-token"), "and what is in them can't be seen on the wire");
+        CHECK(relay_c.open(sealed).has_value() && !relay_c.open(sealed), "a frame replayed is refused");
+
+        // Pinning, and trust on first use.
+        auto other = run(CryptoEngine::random_bytes(32));
+        CHECK(!other.client_ok && other.error.find("identity has changed") != std::string::npos, "a relay that isn't the pinned one is refused: " + other.error);
+        auto tofu = run(Bytes());
+        CHECK(tofu.client_ok && tofu.got_id == relay_id, "with nothing pinned yet, the relay is accepted and its ID reported, to be remembered");
+
+        // Someone in the middle.
+        auto swap_kem = run(relay_id, [&](Bytes& sh) {
+            auto s = sc::decode_server_hello(sh);
+            s->kem_public = CryptoEngine::generate_kem_keypair().public_key;
+            sh = sc::encode(*s);
+        });
+        auto swap_x = run(relay_id, [&](Bytes& sh) {
+            auto s = sc::decode_server_hello(sh);
+            s->x25519_public = CryptoEngine::generate_x25519().public_key;
+            sh = sc::encode(*s);
+        });
+        CHECK(!swap_kem.client_ok && !swap_x.client_ok, "swapping in their own one-connection ML-KEM or X25519 key breaks the relay's signature: refused");
+        const auto impostor = CryptoEngine::generate_sig_keypair();
+        {
+            sc::ClientHandshake client;
+            sc::ServerHandshake fake(impostor);
+            Bytes sh, fin, id;
+            sc::Keys k;
+            std::string e;
+            CHECK(fake.reply(client.hello(), sh) && !client.finish(sh, relay_id, fin, k, id, e), "an impostor with its own identity key is refused when the relay is pinned");
+        }
+        {
+            // A reply recorded from one connection, played to another (with a different client hello).
+            sc::ClientHandshake first, second;
+            sc::ServerHandshake server(relay_identity);
+            Bytes sh, fin, id;
+            sc::Keys k;
+            std::string e;
+            server.reply(first.hello(), sh);
+            second.hello();
+            CHECK(!second.finish(sh, relay_id, fin, k, id, e), "a relay's answer replayed into another connection is refused (it is signed together with that connection's hello)");
+        }
+        int accepted = 0, tried = 0;
+        for (size_t i = 12; i < r.server_hello.size(); i += 97) {
+            auto t = run(relay_id, [&](Bytes& sh) { sh[i] ^= 1; });
+            tried++;
+            if (t.client_ok) accepted++;
+        }
+        CHECK(accepted == 0 && tried > 20, "a bit flipped anywhere in the relay's answer is refused");
+        auto bad_finish = run(relay_id, nullptr, [&](Bytes& f) { f[100] ^= 1; });
+        bool mismatch = !bad_finish.server_ok || bad_finish.sk.recv != bad_finish.ck.send;
+        if (bad_finish.server_ok) {
+            sc::Cipher cc(bad_finish.ck, true), rc(bad_finish.sk, false);
+            mismatch = mismatch && !rc.open(cc.seal(secret_text));
+        }
+        CHECK(mismatch, "an altered last message leaves the two sides with different keys: the first frame fails");
+
+        // Frames.
+        {
+            sc::Cipher c(r2.ck, true), rl(r2.sk, false);
+            Bytes f1 = c.seal(Bytes{1}), f2 = c.seal(Bytes{2});
+            CHECK(!rl.open(f2) && !rl.open(f1), "a frame out of order is refused, and after that the channel is dead");
+        }
+        {
+            sc::Cipher c(r2.ck, true), rl(r2.sk, false);
+            Bytes f = c.seal(secret_text);
+            Bytes bad = f;
+            bad[3] ^= 1;
+            CHECK(!rl.open(bad) && !rl.open(f), "an altered frame is refused (and so is everything after it)");
+        }
+        {
+            sc::Cipher c(r2.ck, true), rl(r2.sk, false);
+            Bytes f = c.seal(secret_text);
+            CHECK(!rl.open(Bytes(f.begin(), f.end() - 1)) && !c.open(c.seal(secret_text)), "a truncated frame is refused, and a frame can't be bounced back to its sender");
+        }
+
+        // Strict parsing.
+        check_framing("client hello", r.hello, sc::decode_client_hello);
+        fuzz("client hello", r.hello, sc::decode_client_hello);
+        check_framing("server hello", r.server_hello, sc::decode_server_hello);
+        fuzz("server hello", r.server_hello, sc::decode_server_hello);
+        check_framing("client finish", r.finish, sc::decode_client_finish);
+        fuzz("client finish", r.finish, sc::decode_client_finish);
+        Bytes wrong_magic = r.hello; wrong_magic[0] = 'X';
+        Bytes wrong_version = r.hello; wrong_version[7] = 2;
+        Bytes wrong_kind = r.hello; wrong_kind[11] = 2;
+        CHECK(!sc::decode_client_hello(wrong_magic) && !sc::decode_client_hello(wrong_version) && !sc::decode_client_hello(wrong_kind) && !sc::decode_server_hello(r.hello) && !sc::decode_client_finish(r.server_hello),
+              "a wrong magic, version or kind of message is refused");
+        CHECK(throws([] { sc::encode(sc::ClientHello{Bytes(31, 1), Bytes(32, 1)}); }), "a malformed hello can't be made");
     }
 
     std::cout << "Revocable deposits\n";

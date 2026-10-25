@@ -22,6 +22,13 @@ option(PQ_BUILD_TESTS "Build the test suite" OFF)
 find_package(Threads REQUIRED)
 find_package(OpenSSL 1.1.1 REQUIRED)
 find_package(SQLite3 REQUIRED)
+# Newer CMake names SQLite's target SQLite3::SQLite3 and marks the old name, SQLite::SQLite3, deprecated (with a warning);
+# older CMake has only the old name. Use whichever this CMake provides.
+if(TARGET SQLite3::SQLite3)
+    set(PQ_SQLITE_TARGET SQLite3::SQLite3)
+else()
+    set(PQ_SQLITE_TARGET SQLite::SQLite3)
+endif()
 
 function(pq_warnings target)
     if(MSVC)
@@ -60,7 +67,7 @@ if(WIN32)
 endif()
 
 # --- Crypto wrappers (liboqs + OpenSSL), used by relay and client ---
-add_library(pq_crypto STATIC client/crypto_engine.cpp)
+add_library(pq_crypto STATIC client/crypto_engine.cpp client/secure_channel.cpp)
 target_include_directories(pq_crypto PUBLIC ${CMAKE_SOURCE_DIR}/client)
 target_link_libraries(pq_crypto PUBLIC protocol ${PQ_OQS} OpenSSL::Crypto)
 pq_warnings(pq_crypto)
@@ -68,7 +75,7 @@ pq_warnings(pq_crypto)
 # --- The relay: mailbox store and service (protocol v3) ---
 add_library(pq_relay STATIC server/relay_store.cpp server/relay_service.cpp)
 target_include_directories(pq_relay PUBLIC ${CMAKE_SOURCE_DIR}/server)
-target_link_libraries(pq_relay PUBLIC pq_crypto protocol SQLite::SQLite3 Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(pq_relay PUBLIC pq_crypto protocol ${PQ_SQLITE_TARGET} Threads::Threads ${CMAKE_DL_LIBS})
 pq_warnings(pq_relay)
 
 # --- Relay server: protocol v3 mailboxes plus the v2 file transfer ---
@@ -95,7 +102,7 @@ add_library(pq_core STATIC
     client/messaging_engine.cpp
 )
 target_include_directories(pq_core PUBLIC ${CMAKE_SOURCE_DIR}/client)
-target_link_libraries(pq_core PUBLIC pq_crypto protocol Threads::Threads OpenSSL::Crypto SQLite::SQLite3)
+target_link_libraries(pq_core PUBLIC pq_crypto protocol Threads::Threads OpenSSL::Crypto ${PQ_SQLITE_TARGET})
 pq_warnings(pq_core)
 
 # --- Command-line check for a relay (no Qt) ---

@@ -8,6 +8,9 @@
 #include <cstdio>
 
 #include <QCheckBox>
+#include <QComboBox>
+#include <QDialogButtonBox>
+#include <QFormLayout>
 #include <QClipboard>
 #include <QDateTime>
 #include <QAction>
@@ -1394,22 +1397,9 @@ void ChatWidget::render_private_messages(bool force_scroll) {
 // Starts a Private chat with the contact on screen (or one chosen from the list). The first time, it says plainly what a Private
 // chat is and isn't, so it is never mistaken for a saved one.
 void ChatWidget::start_private_chat() {
-    std::string fp = current_fp_.toStdString();
-    if (fp.empty()) {
-        QStringList names;
-        std::vector<std::string> fps;
-        for (const auto& c : engine_->chats()) {
-            names << qstr(c.contact_name);
-            fps.push_back(c.contact_fp);
-        }
-        if (fps.empty()) {
-            QMessageBox::information(this, "New Private chat", "Add a contact first.");
-            return;
-        }
-        bool ok = false;
-        const QString chosen = QInputDialog::getItem(this, "New Private chat", "Who with?", names, 0, false, &ok);
-        if (!ok) return;
-        fp = fps[static_cast<size_t>(std::max(0, static_cast<int>(names.indexOf(chosen))))];
+    if (engine_->chats().empty()) {
+        QMessageBox::information(this, "New Private chat", "Add a contact first.");
+        return;
     }
     QSettings settings;
     if (!settings.value("private_chats/explained", false).toBool()) {
@@ -1427,15 +1417,52 @@ void ChatWidget::start_private_chat() {
         if (about.exec() != QMessageBox::Ok) return;
         settings.setValue("private_chats/explained", true);
     }
-    bool ok = false;
-    const QStringList starts = {"From when a message is sent", "From when a message is read"};
-    const QString start = QInputDialog::getItem(this, "New Private chat", "When should a message's timer start?\n(This can't be changed later.)", starts, 1, false, &ok);
-    if (!ok) return;
-    const QStringList lengths = {"1 hour", "1 day", "7 days", "30 days"};
-    const QString length = QInputDialog::getItem(this, "New Private chat", "How long should messages last?\n(This can't be changed later.)", lengths, 1, false, &ok);
-    if (!ok) return;
-    const int mode = start == starts[0] ? 1 : 2;
-    const int64_t timer = length == lengths[0] ? 3600 : length == lengths[1] ? 86400 : length == lengths[2] ? 7 * 86400 : 30 * 86400;
+    // Everything in one dialog: who with (only when no contact is on screen), when the timer starts, and how long messages last.
+    QDialog dialog(this);
+    dialog.setWindowTitle("⏳ New Private chat");
+    auto* form = new QFormLayout(&dialog);
+    QComboBox* who = nullptr;
+    std::vector<std::string> fps;
+    std::string fp = current_fp_.toStdString();
+    if (fp.empty()) {
+        who = new QComboBox(&dialog);
+        for (const auto& c : engine_->chats()) {
+            who->addItem(qstr(c.contact_name));
+            fps.push_back(c.contact_fp);
+        }
+        form->addRow("With:", who);
+    } else {
+        for (const auto& c : engine_->chats())
+            if (c.contact_fp == fp) form->addRow("With:", new QLabel(qstr(c.contact_name), &dialog));
+    }
+    auto* starts = new QComboBox(&dialog);
+    starts->addItem("When a message is read");
+    starts->addItem("When a message is sent");
+    form->addRow("Timer starts:", starts);
+    auto* lengths = new QComboBox(&dialog);
+    lengths->addItem("1 hour");
+    lengths->addItem("1 day");
+    lengths->addItem("7 days");
+    lengths->addItem("30 days");
+    lengths->setCurrentIndex(1);
+    form->addRow("Messages last:", lengths);
+    auto* note = new QLabel("These can't be changed once the chat has started.", &dialog);
+    note->setTextFormat(Qt::PlainText);
+    form->addRow(note);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText("Start Private chat");
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    form->addRow(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+    if (who) {
+        const int i = who->currentIndex();
+        if (i < 0 || static_cast<size_t>(i) >= fps.size()) return;
+        fp = fps[static_cast<size_t>(i)];
+    }
+    const int mode = starts->currentIndex() == 1 ? 1 : 2;
+    static const int64_t TIMERS[] = {3600, 86400, 7 * 86400, 30 * 86400};
+    const int64_t timer = TIMERS[std::clamp(lengths->currentIndex(), 0, 3)];
     std::string chat_id, error;
     if (!engine_->start_private_chat(fp, mode, timer, chat_id, error)) {
         QMessageBox::warning(this, "New Private chat", qstr(error));
