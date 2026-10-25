@@ -50,7 +50,7 @@ The assistant's sandbox has **no Qt, no CMake, no real liboqs and no SQLite head
 - Code is compiled with `-Wall -Wextra -Wpedantic -Werror` against a fake liboqs and a small SQLite header shim, and the full suites run against those.
 - The Qt code (`chat_widget`, `main_window`) is only type-checked against a hand-written stub of the Qt classes. That catches typos and API mismatches in our own code, not Qt misuse.
 - **The first CI run is the real test** for the GUI, CMake, Windows and the real liboqs. If it fails, paste the compiler error.
-- Test totals at last run: **2,060 checks, 0 failed** (sharing 117, keys 69, contacts 58, chat_formats 314, history 269, relay_protocol 203, relay_store 194, e2e 48, relay 252, chat 148, relay_setup 30, group 358). The group suite takes about twelve minutes. If a run is interrupted, check for a stray `pq-server` process (`pkill -x pq-server`) before the next: it can hold a port and make an unrelated suite fail once. The group suite takes about nine minutes. Run the suites one at a time: they pick ports from a shared range, and two at once can collide. The group suite runs up to 18 real engines and takes a few minutes. The relay limits mailbox registrations to 10 per minute per address (hard-coded, separate from `--rate-limit`), so tests with many people wait out that window. Linux and macOS only for the process-spawning ones. `ctest --test-dir build --output-on-failure`.
+- Test totals at last run: **2,078 checks, 0 failed** (sharing 117, keys 69, contacts 58, chat_formats 314, history 269, relay_protocol 203, relay_store 194, e2e 48, relay 252, chat 166, relay_setup 30, group 358). The group suite takes about twelve minutes. If a run is interrupted, check for a stray `pq-server` process (`pkill -x pq-server`) before the next: it can hold a port and make an unrelated suite fail once. The group suite takes about nine minutes. Run the suites one at a time: they pick ports from a shared range, and two at once can collide. The group suite runs up to 18 real engines and takes a few minutes. The relay limits mailbox registrations to 10 per minute per address (hard-coded, separate from `--rate-limit`), so tests with many people wait out that window. Linux and macOS only for the process-spawning ones. `ctest --test-dir build --output-on-failure`.
 
 ## Operational facts and gotchas
 
@@ -77,7 +77,7 @@ The assistant's sandbox has **no Qt, no CMake, no real liboqs and no SQLite head
 - **M3 groups** is complete (see "M3: decisions and build order" below). Next is **M4 archive and restore**, which removes the "history only on this device" limit; groups already keep their conversation as signed, hash-chained records, which is what the archive will store.
 - Known limits of M3 worth knowing: membership is fixed at creation (changing a group means making a new one linked to the old); if a group's creator is offline, members who aren't each other's contacts stay "setting up" until it returns; there is no forward secrecy or archive yet (M6, M4); the relay allows 10 mailbox registrations per minute per address.
 
-## M7: Private chats (in progress; steps 1 to 4 of 5 done)
+## M7: Private chats (built; all 5 steps done; the GUI type-checked only)
 
 A Private chat is a separate, timed conversation with a contact, next to the Saved chat with them. Its messages disappear on a timer and, with M6's forward secrecy, are then unrecoverable between honest apps. Never archived, never in the keyring, never restored.
 
@@ -94,7 +94,19 @@ Decisions settled with the maintainer:
 | 5 | Copying text is allowed; the chat header notes that copies, screenshots and exported files don't expire. |
 | 6 | GUI: \"New Private chat...\" with a mode and timer picker; the header shows the rule (\"Private · 7 days after reading\") and each message its time left; an **hourglass icon** marks Private chats in the chat list and header; a **one-time explanation** the first time someone starts one (what disappears and when, and what doesn't); Private chats are labelled and kept apart from Saved ones in the list. The maintainer asked that users clearly understand the difference. |
 
-Build order: 1. records and the private store (**done**); 2. relay: envelope lifetimes tied to expiry, the revocation token (**done**); 3. engine (**done**); 4. GUI (**done**, type-checked only); 5. end-to-end and hostile tests.
+Build order: 1. records and the private store (**done**); 2. relay: envelope lifetimes tied to expiry, the revocation token (**done**); 3. engine (**done**); 4. GUI (**done**, type-checked only); 5. end-to-end and hostile tests (**done**).
+
+**Step 5 as built** (the hostile-case pass, tests only; chat suite section 11e). Records are crafted by hand, signed with the sender's real key and put straight into the recipient's mailbox, as a modified app could:
+
+- a second start for an existing Private chat, with a different rule: ignored, the rule stays as it began;
+- a start reusing the ID of the two people's **saved** chat: refused, so a saved chat can't be turned into a Private one;
+- **someone outside the chat** (a genuine contact of the recipient) writing into it: ignored;
+- a retraction of the recipient's own message by the other person, one by an outsider, and one of a message the recipient has already seen (sent past the sender's app, which refuses it): all ignored, the message stays;
+- **a wipe and restore** of the recipient's device: no Private chat and no Private message comes back (they were never in the keyring or any archive), and the saved chat still works once the restored app has put up new one-time keys.
+
+Covered in step 3 and not repeated: wrong-time messages, the three retraction cases, erasure from the store, and three mutation checks.
+
+**M7 known limits, in one place:** one-to-one only; **no files in Private chats yet**; read receipts are always on in Private chats (a departure from the design, explained above); a message queued but not yet sent is still sent after a retraction (the `Retract` that follows removes it unread); copies, screenshots, exports and modified apps are outside any app's control; a solid-state disk may keep old copies of erased keys; the GUI has only been type-checked here.
 
 **Step 4 as built** (`ChatWidget`; type-checked against the Qt stub, not run here):
 

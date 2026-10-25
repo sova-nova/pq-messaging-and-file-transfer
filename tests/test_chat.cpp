@@ -838,6 +838,107 @@ int main(int argc, char** argv) {
         (void)now0;
     }
 
+    std::cout << "11e. Private chats against hostile records\n";
+    {
+        std::string err;
+        auto pchat = [&](User& u, const std::string& id) -> std::optional<MessagingEngine::PrivateChatSummary> {
+            for (auto& c : u.engine->private_chats()) if (c.id == id) return c;
+            return std::nullopt;
+        };
+        auto pmsg = [&](User& u, const std::string& id, const std::string& text) -> std::optional<MessagingEngine::PrivateMessage> {
+            for (auto& m : u.engine->private_messages(id)) if (m.text == text) return m;
+            return std::nullopt;
+        };
+        // Fran is a contact of Bob's, but not part of his Private chat with Alice.
+        User& fran = make_user("fran");
+        setup_user(srv, fran);
+        introduce(bob, fran, "Bob", "for Fran");
+        introduce(fran, bob, "Fran", "for Bob");
+        // A record signed with the sender's real key, sealed to the recipient and put straight in their mailbox: what a modified app could send.
+        auto craft = [&](User& from, const Bytes& conv, const std::vector<Bytes>& people, chat::RecordType type, const Bytes& payload) {
+            chat::Record r;
+            r.conversation_id = conv;
+            r.message_id = CryptoEngine::random_bytes(16);
+            r.sender = *hex_to_bytes(from.fp);
+            r.recipients_hash = chat::recipients_hash_for(people);
+            r.sent_at = static_cast<uint64_t>(time(nullptr));
+            r.type = type;
+            r.payload = payload;
+            return r;
+        };
+        auto deliver = [&](User& from, User& to, const chat::Record& r) {
+            as(from);
+            chat::Inner in;
+            in.records = {chat::sign_record(r, from.keys->load_private_dsa())};
+            auto contact = from.keys->find_contact_by_fingerprint(to.fp);
+            auto address = contact ? parse_server_address(contact->relay_address) : std::nullopt;
+            RelayClient c;
+            std::string e;
+            return address && c.connect(address->host, address->port, contact->relay_id, 5, e) &&
+                   c.deposit(contact->mailbox_id, contact->send_token, chat::seal_envelope(in, contact->pub_kem), 3600, nullptr, e);
+        };
+        const Bytes a = *hex_to_bytes(alice.fp), b = *hex_to_bytes(bob.fp), f = *hex_to_bytes(fran.fp);
+
+        std::string chat5;
+        CHECK(alice.engine->start_private_chat(bob.fp, 1, 3600, chat5, err) && wait_for([&] { return pchat(bob, chat5).has_value(); }, 30000), "(a Private chat between Alice and Bob: 1 hour from sending)");
+        const Bytes conv5 = *hex_to_bytes(chat5);
+
+        // The rule can't be changed by starting the same chat again.
+        CHECK(deliver(alice, bob, craft(alice, conv5, {a, b}, chat::RecordType::PrivateStart, chat::private_start_payload({chat::PrivateMode::FromReading, 30 * 86400}))),
+              "(Alice's key signs a second start for the same chat, now saying 30 days from reading)");
+        run_for(4000);
+        auto still = pchat(bob, chat5);
+        CHECK(still && still->mode == 1 && still->timer == 3600, "Bob's app keeps the rule it was started with: a chat's rule can't be changed afterwards");
+
+        // A start can't take over another chat's conversation ID.
+        const Bytes saved_conv = *hex_to_bytes(*alice.engine->direct_conversation_id(bob.fp));
+        CHECK(deliver(alice, bob, craft(alice, saved_conv, {a, b}, chat::RecordType::PrivateStart, chat::private_start_payload({chat::PrivateMode::FromSending, 3600}))),
+              "(a start that reuses the ID of Alice and Bob's saved chat)");
+        run_for(4000);
+        CHECK(!pchat(bob, bytes_to_hex(saved_conv)), "is refused: the saved chat can't be turned into a Private one");
+
+        // Someone outside the chat can't write into it.
+        CHECK(deliver(fran, bob, craft(fran, conv5, {f, b}, chat::RecordType::Text, Bytes{'f', 'r', 'o', 'm', ' ', 'f', 'r', 'a', 'n'})), "(Fran, Bob's contact but not in this chat, writes into it)");
+        run_for(4000);
+        CHECK(!pmsg(bob, chat5, "from fran"), "her message doesn't appear in it");
+
+        // Retractions from the wrong person, or of something already seen.
+        CHECK(bob.engine->send_private_text(chat5, "bob's own", err) && wait_for([&] { return pmsg(alice, chat5, "bob's own").has_value(); }, 30000), "(Bob sends a message in the chat)");
+        const Bytes bobs_id = *hex_to_bytes(pmsg(bob, chat5, "bob's own")->id);
+        deliver(alice, bob, craft(alice, conv5, {a, b}, chat::RecordType::Retract, chat::retract_payload(bobs_id)));
+        run_for(4000);
+        CHECK(pmsg(bob, chat5, "bob's own").has_value(), "Alice can't retract Bob's message: only its sender can");
+        CHECK(alice.engine->send_private_text(chat5, "unread for now", err) && wait_for([&] { return pmsg(bob, chat5, "unread for now").has_value(); }, 30000), "(Alice sends a message Bob hasn't looked at)");
+        const Bytes unread_id = *hex_to_bytes(pmsg(bob, chat5, "unread for now")->id);
+        deliver(fran, bob, craft(fran, conv5, {f, b}, chat::RecordType::Retract, chat::retract_payload(unread_id)));
+        run_for(4000);
+        CHECK(pmsg(bob, chat5, "unread for now").has_value(), "Fran can't retract it either: she isn't in the chat");
+        bob.engine->mark_private_read(chat5);
+        deliver(alice, bob, craft(alice, conv5, {a, b}, chat::RecordType::Retract, chat::retract_payload(unread_id)));
+        run_for(4000);
+        CHECK(pmsg(bob, chat5, "unread for now").has_value(), "and once Bob has seen it, a retraction from Alice (sent past her own app's refusal) can't reach it");
+
+        // Never backed up, never restored.
+        CHECK(alice.engine->send_private_text(chat5, "not for any backup", err) && wait_for([&] { return pmsg(bob, chat5, "not for any backup").has_value(); }, 30000), "(one more Private message)");
+        CHECK(bob.engine->save_keyring(err), "(Bob's keyring is saved to his relay)");
+        const fs::path private_path = bob.engine->private_store_path();
+        const std::string history_stem = private_path.stem().string().substr(0, private_path.stem().string().size() - std::string("-private").size());
+        bob.engine.reset();
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(private_path.parent_path(), ec))
+            if (entry.path().filename().string().rfind(history_stem, 0) == 0) fs::remove(entry.path(), ec);  // his history and both small stores
+        restart_engine(bob);
+        MessagingEngine::RestoreReport report;
+        CHECK(bob.engine->restore_from_relay(report, err), "Bob's device is wiped and restored from his relay (" + err + ")");
+        bool private_text_back = false;
+        for (auto& m : bob.engine->messages(alice.fp)) private_text_back |= m.text == "not for any backup" || m.text == "unread for now";
+        CHECK(bob.engine->private_chats().empty() && !private_text_back, "no Private chat, and no Private message, comes back: they were never in his keyring or any archive");
+        // (After a restore his app first replaces his one-time keys on the relay; a message sealed to the old ones would be lost, as M6 says.)
+        CHECK(wait_for([&] { auto i = bob.engine->prekey_info(); return i.relay_matches && i.relay_one_time > 0; }, 30000), "(Bob's app puts up a new set of one-time keys)");
+        CHECK(alice.engine->send_text(bob.fp, "saved chats still work", err) && wait_for([&] { for (auto& m : bob.engine->messages(alice.fp)) if (m.text == "saved chats still work") return true; return false; }, 30000),
+              "(and the saved chat still works after the restore)");
+    }
+
     std::cout << "12. Locked keys\n";
     {
         setenv("HOME", (ROOT / "lockbox").c_str(), 1);
