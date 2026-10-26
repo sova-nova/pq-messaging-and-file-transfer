@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "crypto_engine.h"
+#include "protocol.h"
 
 // The encrypted connection to a relay (M8). Underneath both relay protocols (messaging and the older transfer-ID file
 // transfer), so nothing crosses the network in the clear: not invites, not send tokens, not which mailbox signs in.
@@ -104,5 +105,10 @@ private:
     bool is_client_;
     bool broken_ = false;
 };
+
+// On a connected socket: does the handshake and attaches the cipher, so every message after it is encrypted. The client's
+// `expected_relay_id` is the pinned relay ID (empty: accept any, and report it in `relay_id` for trust on first use).
+bool secure_client(socket_t sock, const Bytes& expected_relay_id, Bytes& relay_id, std::string& error);
+bool secure_server(socket_t sock, const CryptoEngine::SigKeyPair& identity);
 
 }  // namespace securechannel

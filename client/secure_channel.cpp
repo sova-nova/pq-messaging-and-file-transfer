@@ -1,5 +1,6 @@
 #include "secure_channel.h"
 
+#include <mutex>
 #include <stdexcept>
 
 #include "protocol.h"
@@ -235,6 +236,59 @@ std::optional<Bytes> Cipher::open(const Bytes& sealed) {
         broken_ = true;  // one bad frame and the channel is finished
         return std::nullopt;
     }
+}
+
+namespace {
+class SocketCipher : public FrameCipher {
+public:
+    SocketCipher(const Keys& keys, bool is_client) : cipher_(keys, is_client) {}
+    std::vector<uint8_t> seal(const std::vector<uint8_t>& frame) override {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        return cipher_.seal(frame);
+    }
+    std::optional<std::vector<uint8_t>> open(const std::vector<uint8_t>& sealed) override {
+        std::lock_guard<std::mutex> lock(recv_mutex_);
+        return cipher_.open(sealed);
+    }
+
+private:
+    Cipher cipher_;
+    std::mutex send_mutex_, recv_mutex_;  // sending and receiving may happen on different threads; each direction has its own counter
+};
+}  // namespace
+
+bool secure_client(socket_t sock, const Bytes& expected_relay_id, Bytes& relay_id, std::string& error) {
+    ClientHandshake hs;
+    Bytes finish;
+    Keys keys;
+    if (!send_handshake(sock, hs.hello())) {
+        error = "Could not reach the relay";
+        return false;
+    }
+    auto reply = recv_handshake(sock);
+    if (!reply) {
+        error = "The relay didn't answer the encrypted handshake (is it an older relay that needs updating?)";
+        return false;
+    }
+    if (!hs.finish(*reply, expected_relay_id, finish, keys, relay_id, error)) return false;
+    if (!send_handshake(sock, finish)) {
+        error = "Could not reach the relay";
+        return false;
+    }
+    attach_frame_cipher(sock, std::make_shared<SocketCipher>(keys, true));
+    return true;
+}
+
+bool secure_server(socket_t sock, const CryptoEngine::SigKeyPair& identity) {
+    ServerHandshake hs(identity);
+    Bytes reply;
+    Keys keys;
+    auto hello = recv_handshake(sock);
+    if (!hello || !hs.reply(*hello, reply) || !send_handshake(sock, reply)) return false;
+    auto finish = recv_handshake(sock);
+    if (!finish || !hs.finish(*finish, keys)) return false;
+    attach_frame_cipher(sock, std::make_shared<SocketCipher>(keys, false));
+    return true;
 }
 
 }  // namespace securechannel

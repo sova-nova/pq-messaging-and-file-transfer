@@ -1,5 +1,8 @@
 #include "protocol.h"
 
+#include <mutex>
+#include <unordered_map>
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -296,7 +299,7 @@ bool recv_exact(socket_t sock, uint8_t* buffer, size_t len) {
     return true;
 }
 
-bool send_message(socket_t sock, MessageType type, const std::vector<uint8_t>& payload) {
+static bool send_message_plain(socket_t sock, MessageType type, const std::vector<uint8_t>& payload) {
     if (payload.size() > 0xFFFFFFFFu) return false;
     // Send the 5-byte prefix separately so large payloads aren't copied.
     std::vector<uint8_t> prefix;
@@ -310,7 +313,7 @@ bool send_text_message(socket_t sock, MessageType type, const std::string& text)
     return send_message(sock, type, std::vector<uint8_t>(text.begin(), text.end()));
 }
 
-std::optional<WireMessage> recv_message(socket_t sock, uint32_t max_payload) {
+static std::optional<WireMessage> recv_message_plain(socket_t sock, uint32_t max_payload) {
     uint8_t prefix[5];
     if (!recv_exact(sock, prefix, sizeof(prefix))) return std::nullopt;
 
@@ -322,5 +325,81 @@ std::optional<WireMessage> recv_message(socket_t sock, uint32_t max_payload) {
     msg.type = static_cast<MessageType>(prefix[4]);
     msg.payload.resize(*payload_len);
     if (*payload_len > 0 && !recv_exact(sock, msg.payload.data(), *payload_len)) return std::nullopt;
+    return msg;
+}
+
+// --- Encrypted connections (M8) ---
+
+namespace {
+std::mutex g_cipher_mutex;
+std::unordered_map<socket_t, std::shared_ptr<FrameCipher>> g_ciphers;
+
+std::shared_ptr<FrameCipher> cipher_of(socket_t sock) {
+    std::lock_guard<std::mutex> lock(g_cipher_mutex);
+    auto it = g_ciphers.find(sock);
+    return it == g_ciphers.end() ? nullptr : it->second;
+}
+
+bool send_sized(socket_t sock, const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> prefix;
+    write_u32(prefix, static_cast<uint32_t>(data.size()));
+    return send_exact(sock, prefix.data(), prefix.size()) && (data.empty() || send_exact(sock, data.data(), data.size()));
+}
+
+std::optional<std::vector<uint8_t>> recv_sized(socket_t sock, uint32_t max_size) {
+    uint8_t prefix[4];
+    if (!recv_exact(sock, prefix, sizeof(prefix))) return std::nullopt;
+    size_t off = 0;
+    auto len = read_u32(prefix, sizeof(prefix), off);
+    if (!len || *len > max_size) return std::nullopt;
+    std::vector<uint8_t> data(*len);
+    if (*len > 0 && !recv_exact(sock, data.data(), *len)) return std::nullopt;
+    return data;
+}
+}  // namespace
+
+void attach_frame_cipher(socket_t sock, std::shared_ptr<FrameCipher> cipher) {
+    std::lock_guard<std::mutex> lock(g_cipher_mutex);
+    g_ciphers[sock] = std::move(cipher);
+}
+
+void detach_frame_cipher(socket_t sock) {
+    std::lock_guard<std::mutex> lock(g_cipher_mutex);
+    g_ciphers.erase(sock);
+}
+
+bool has_frame_cipher(socket_t sock) { return cipher_of(sock) != nullptr; }
+
+bool send_handshake(socket_t sock, const std::vector<uint8_t>& data) { return data.size() <= MAX_HANDSHAKE_FRAME && send_sized(sock, data); }
+
+std::optional<std::vector<uint8_t>> recv_handshake(socket_t sock) { return recv_sized(sock, MAX_HANDSHAKE_FRAME); }
+
+bool send_message(socket_t sock, MessageType type, const std::vector<uint8_t>& payload) {
+    auto cipher = cipher_of(sock);
+    if (!cipher) return send_message_plain(sock, type, payload);
+    std::vector<uint8_t> sealed;
+    try {
+        sealed = cipher->seal(serialize_wire_message(type, payload));
+    } catch (const std::exception&) {
+        return false;
+    }
+    return send_sized(sock, sealed);
+}
+
+std::optional<WireMessage> recv_message(socket_t sock, uint32_t max_payload) {
+    auto cipher = cipher_of(sock);
+    if (!cipher) return recv_message_plain(sock, max_payload);
+    // A sealed frame is the message (5 bytes of header and its payload) plus 16 bytes of tag: anything longer is refused unread.
+    const uint64_t limit = static_cast<uint64_t>(max_payload) + 5 + 16;
+    auto sealed = recv_sized(sock, static_cast<uint32_t>(std::min<uint64_t>(limit, 0xFFFFFFFFu)));
+    if (!sealed) return std::nullopt;
+    auto frame = cipher->open(*sealed);
+    if (!frame || frame->size() < 5) return std::nullopt;
+    size_t off = 0;
+    auto payload_len = read_u32(frame->data(), frame->size(), off);
+    if (!payload_len || *payload_len > max_payload || frame->size() != 5 + static_cast<size_t>(*payload_len)) return std::nullopt;
+    WireMessage msg;
+    msg.type = static_cast<MessageType>((*frame)[4]);
+    msg.payload.assign(frame->begin() + 5, frame->end());
     return msg;
 }

@@ -1,4 +1,5 @@
 #include "main_window.h"
+#include "scope_exit.h"
 #include "crypto_engine.h"
 #include "chat_widget.h"
 #include "key_dialogs.h"
@@ -826,7 +827,10 @@ void MainWindow::start_send() {
     copy_link_button_->setEnabled(false);
     copy_id_button_->setEnabled(false);
 
-    run_in_background([this, path = filepath.toStdString(), host, port, contact = *recipient] {
+    const auto pin = trusted_relay_for(host, port);
+    engine_.set_trusted_relay(pin);
+    run_in_background([this, path = filepath.toStdString(), host, port, contact = *recipient, pin] {
+        auto remember = make_scope_exit([&] { remember_relay(host, port, pin); });
         engine_.upload_file(path, host, port, contact);
     });
 }
@@ -885,9 +889,30 @@ void MainWindow::start_receive() {
     copy_id_button_->setEnabled(false);
 
     std::string output_dir = keystore_->downloads_dir().u8string();
-    run_in_background([this, id, host, port, output_dir] {
+    const auto pin = trusted_relay_for(host, port);
+    engine_.set_trusted_relay(pin);
+    run_in_background([this, id, host, port, output_dir, pin] {
+        auto remember = make_scope_exit([&] { remember_relay(host, port, pin); });
         engine_.download_file(id, host, port, output_dir);
     });
+}
+
+// Which relay ID the Files tab insists on for host:port: messaging's relay, if it is the same one; otherwise the one seen the
+// first time this address was used (trust on first use). Empty if neither: the connection is then accepted and remembered.
+std::vector<uint8_t> MainWindow::trusted_relay_for(const std::string& host, uint16_t port) {
+    if (auto config = keystore_->load_mailbox_config(); config && config->host == host && config->port == port) return config->relay_id;
+    QSettings settings;
+    const QString saved = settings.value("relay_pins/" + qstr(host) + ":" + QString::number(port)).toString();
+    auto bytes = hex_to_bytes(saved.toStdString());
+    return bytes ? *bytes : std::vector<uint8_t>();
+}
+
+void MainWindow::remember_relay(const std::string& host, uint16_t port, const std::vector<uint8_t>& pin) {
+    if (!pin.empty()) return;  // already trusted
+    const auto seen = engine_.relay_seen();
+    if (seen.empty()) return;
+    QSettings settings;
+    settings.setValue("relay_pins/" + qstr(host) + ":" + QString::number(port), qstr(bytes_to_hex(seen)));
 }
 
 void MainWindow::run_in_background(std::function<void()> job) {

@@ -7,11 +7,14 @@
 #include "archive.h"
 #include "protocol.h"
 #include "relay_client.h"
+#include "secure_channel.h"
 #include "relay_protocol.h"
 #include "sharing.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -105,6 +108,70 @@ struct Box {
 
 static std::string host() { return "127.0.0.1"; }
 
+// A proxy between a client and a relay that records what crosses the network, and can change one byte on its way to the relay.
+struct Proxy {
+    socket_t listener = INVALID_SOCKET_VAL;
+    int port = 0;
+    long flip_at = -1;  // the offset, in what the client sends, of a byte to change (-1: none)
+    std::mutex m;
+    std::vector<uint8_t> to_relay, to_client;
+    std::thread worker;
+    bool start(int upstream_port) {
+        listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = 0;
+        if (listener == INVALID_SOCKET_VAL || ::bind(listener, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || ::listen(listener, 4) != 0) return false;
+        socklen_t len = sizeof(a);
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&a), &len);
+        port = ntohs(a.sin_port);
+        worker = std::thread([this, upstream_port] {
+            socket_t c = ::accept(listener, nullptr, nullptr);
+            if (c == INVALID_SOCKET_VAL) return;
+            socket_t u = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in up{};
+            up.sin_family = AF_INET;
+            up.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            up.sin_port = htons(static_cast<uint16_t>(upstream_port));
+            if (::connect(u, reinterpret_cast<sockaddr*>(&up), sizeof(up)) != 0) { close_socket(c); close_socket(u); return; }
+            auto pump = [this](socket_t from, socket_t to, std::vector<uint8_t>& record, bool may_flip) {
+                char buf[4096];
+                long total = 0;
+                while (true) {
+                    auto n = ::recv(from, buf, sizeof(buf), 0);
+                    if (n <= 0) break;
+                    {
+                        std::lock_guard<std::mutex> lock(m);
+                        if (may_flip && flip_at >= total && flip_at < total + n) buf[flip_at - total] ^= 1;
+                        record.insert(record.end(), buf, buf + n);
+                    }
+                    total += n;
+                    if (::send(to, buf, static_cast<size_t>(n), SEND_FLAGS) != n) break;
+                }
+                ::shutdown(to, SHUTDOWN_BOTH);
+            };
+            std::thread upward([&] { pump(c, u, to_relay, true); });
+            pump(u, c, to_client, false);
+            upward.join();
+            close_socket(c);
+            close_socket(u);
+        });
+        return true;
+    }
+    std::vector<uint8_t> recorded() {
+        std::lock_guard<std::mutex> lock(m);
+        std::vector<uint8_t> all = to_relay;
+        all.insert(all.end(), to_client.begin(), to_client.end());
+        return all;
+    }
+    ~Proxy() {
+        if (listener != INVALID_SOCKET_VAL) close_socket(listener);
+        if (worker.joinable()) worker.join();
+    }
+};
+
+
 static bool connect_to(RelayClient& c, const Server& s, const Bytes& pin, std::string& err) {
     return c.connect(host(), static_cast<uint16_t>(s.port), pin, 5, err);
 }
@@ -147,6 +214,7 @@ static std::vector<relay::StoredEnvelope> drain(RelayClient& c, int timeout_ms =
 struct Raw {
     socket_t s = INVALID_SOCKET_VAL;
     Bytes challenge;
+    bool secure = true;
     ~Raw() { if (s != INVALID_SOCKET_VAL) close_socket(s); }
 
     bool open(const Server& srv) {
@@ -157,6 +225,11 @@ struct Raw {
         bool ok = s != INVALID_SOCKET_VAL && connect(s, ai->ai_addr, ai->ai_addrlen) == 0;
         freeaddrinfo(ai);
         if (ok) set_socket_timeouts(s, 5);
+        if (ok && secure) {  // every connection to a relay is encrypted (M8); `secure = false` speaks in the clear, as an old app would
+            Bytes seen;
+            std::string e;
+            ok = securechannel::secure_client(s, Bytes(), seen, e);
+        }
         return ok;
     }
     bool hello() {
@@ -226,7 +299,7 @@ static void test_real_relay() {
         CHECK(connect_to(c, main_srv, pin, err) && c.relay_id() == pin, "connecting with the right pinned relay ID works (" + err + ")");
         RelayClient wrong;
         Bytes other = pin; other[0] ^= 1;
-        CHECK(!connect_to(wrong, main_srv, other, err) && has(err, "does not match"), "a different pinned ID is refused: " + err);
+        CHECK(!connect_to(wrong, main_srv, other, err) && (has(err, "does not match") || has(err, "identity has changed")), "a different pinned ID is refused: " + err);
         RelayClient first_contact;
         CHECK(connect_to(first_contact, main_srv, {}, err) && first_contact.relay_id() == pin, "with no pin the relay is accepted and reports its ID for the user to compare");
     }
@@ -794,6 +867,54 @@ static void test_real_relay() {
         keyring.stop();
     }
 
+    std::cout << "12i. Encrypted connections\n";
+    {
+        const int ebase = 53000 + static_cast<int>(getpid() % 400) * 2;
+        Server enc{ebase, ROOT / "relay-encrypted", {}};
+        if (!enc.start()) { std::cout << "FAIL could not start the relay\n"; failures++; return; }
+        auto einvite = enc.invite();
+        const Bytes epin = einvite->relay_id;
+        auto box = make_box(enc, epin);
+        if (!box) { std::cout << "FAIL setup\n"; failures++; return; }
+        auto contains = [](const Bytes& hay, const Bytes& needle) { return std::search(hay.begin(), hay.end(), needle.begin(), needle.end()) != hay.end(); };
+        std::string e;
+        {
+            Raw plain;
+            plain.secure = false;
+            CHECK(plain.open(enc) && !plain.hello(), "an app that doesn't encrypt (an older one) gets no answer: the relay closes the connection");
+        }
+        {
+            Proxy px;
+            CHECK(px.start(enc.port), "(a proxy that records everything between a client and the relay)");
+            const std::string text = "THE-MESSAGE-ITSELF-0123456789-ABCDEFGHIJKLMNOP";
+            Bytes message;
+            for (int i = 0; i < 40; i++) message.insert(message.end(), text.begin(), text.end());
+            {
+                RelayClient c;
+                CHECK(c.connect(host(), static_cast<uint16_t>(px.port), epin, 5, e) && c.deposit(box->id, box->token, message, 3600, nullptr, e), "a message is deposited through it (" + e + ")");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            const Bytes wire = px.recorded();
+            CHECK(wire.size() > message.size() && !contains(wire, box->token) && !contains(wire, box->id) && !contains(wire, Bytes(text.begin(), text.end())),
+                  "the send token, the mailbox ID and the message never cross the network in the clear");
+        }
+        {
+            Proxy px;
+            px.flip_at = 4000;  // past the handshake: inside the encrypted deposit
+            px.start(enc.port);
+            RelayClient c;
+            bool deposited = c.connect(host(), static_cast<uint16_t>(px.port), epin, 5, e) && c.deposit(box->id, box->token, Bytes(6000, 0x41), 3600, nullptr, e);
+            CHECK(!deposited, "one byte changed in transit, and the connection breaks: nothing tampered with is accepted");
+        }
+        {
+            RelayClient c;
+            std::string wrong;
+            CHECK(!c.connect(host(), static_cast<uint16_t>(enc.port), CryptoEngine::random_bytes(32), 5, wrong) && has(wrong, "identity has changed"),
+                  "a relay that isn't the pinned one is refused before anything is sent: " + wrong);
+        }
+        enc.stop();
+    }
+
     std::cout << "12h. Taking back an envelope that is still waiting\n";
     {
         const int rbase = 54000 + static_cast<int>(getpid() % 400) * 2;
@@ -1355,18 +1476,28 @@ struct FakeRelay {
         int c = accept(listen_fd, nullptr, nullptr);
         if (c < 0) return;
         set_socket_timeouts(c, 6);
+        if (behavior == Behavior::Silent) {  // never answers at all
+            sleep_ms(2500);
+            close_socket(c);
+            return;
+        }
+        // A real relay's first step (M8): the encrypted handshake, signed with this relay's key.
+        if (!securechannel::secure_server(c, key)) {
+            close_socket(c);
+            return;
+        }
         auto hello_msg = recv_message(c, relay::MAX_MESSAGE_PAYLOAD);
         auto hello = hello_msg ? relay::decode_hello(hello_msg->payload) : std::nullopt;
         if (!hello || behavior == Behavior::Silent) {
             if (behavior == Behavior::Silent) sleep_ms(2500);
-            close(c);
+            close_socket(c);
             return;
         }
 
         if (behavior == Behavior::ErrorWithControlChars) {
             std::string nasty = std::string("denied \x1b[31mRED\x1b[0m\x07\n") + std::string(500, 'x');
             send_text_message(c, MessageType::ERROR_MSG, nasty);
-            close(c);
+            close_socket(c);
             return;
         }
 
@@ -1405,7 +1536,7 @@ struct FakeRelay {
                 send_message(c, MessageType::RELAY_COLLECT_END, {});
             }
         }
-        close(c);
+        close_socket(c);
     }
 };
 
@@ -1429,7 +1560,7 @@ static void test_hostile_relay() {
     }
     {
         auto [c, r, ok] = attempt(Behavior::WrongKey, pin);
-        CHECK(!ok && has(err, "does not match"), "a relay with a different key than the pinned one is refused: " + err);
+        CHECK(!ok && (has(err, "does not match") || has(err, "identity has changed")), "a relay with a different key than the pinned one is refused: " + err);
     }
     {
         auto [c, r, ok] = attempt(Behavior::StaleNonce, pin);

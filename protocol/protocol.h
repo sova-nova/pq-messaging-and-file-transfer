@@ -4,6 +4,7 @@
 #include "platform.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -70,6 +71,22 @@ bool send_text_message(socket_t sock, MessageType type, const std::string& text)
 // Receives one message. Returns std::nullopt on error/disconnect, or if the
 // declared payload is larger than `max_payload` (protects against memory DoS).
 std::optional<WireMessage> recv_message(socket_t sock, uint32_t max_payload);
+
+// --- Encrypted connections (M8) ---
+// Once a connection's handshake is done, a cipher is attached to its socket and send_message / recv_message seal and open
+// every frame with it: callers don't change. (See client/secure_channel.h, which makes the cipher.)
+class FrameCipher {
+public:
+    virtual ~FrameCipher() = default;
+    virtual std::vector<uint8_t> seal(const std::vector<uint8_t>& frame) = 0;
+    virtual std::optional<std::vector<uint8_t>> open(const std::vector<uint8_t>& sealed) = 0;
+};
+void attach_frame_cipher(socket_t sock, std::shared_ptr<FrameCipher> cipher);
+bool has_frame_cipher(socket_t sock);
+// The handshake's own messages, before any cipher: a length, then the bytes (at most MAX_HANDSHAKE_FRAME).
+constexpr uint32_t MAX_HANDSHAKE_FRAME = 16 * 1024;
+bool send_handshake(socket_t sock, const std::vector<uint8_t>& data);
+std::optional<std::vector<uint8_t>> recv_handshake(socket_t sock);
 
 // --- Low-level helpers (exposed for testing and for building signed payloads) ---
 

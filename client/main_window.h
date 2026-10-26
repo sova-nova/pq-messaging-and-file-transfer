@@ -90,6 +90,8 @@ private:
     void save_server_setting();
 
     void run_in_background(std::function<void()> job);
+    std::vector<uint8_t> trusted_relay_for(const std::string& host, uint16_t port);
+    void remember_relay(const std::string& host, uint16_t port, const std::vector<uint8_t>& pin);
     void set_busy(bool busy);
 
     void update_status(const std::string& msg);

@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include "sharing.h"
 #include "transfer_engine.h"
+#include "secure_channel.h"
 
 #include <algorithm>
 #include <chrono>
@@ -59,7 +60,7 @@ static bool can_connect() {
     if (getaddrinfo("127.0.0.1", std::to_string(PORT).c_str(), &hints, &ai) != 0) return false;
     int s = socket(ai->ai_family, ai->ai_socktype, 0);
     bool ok = s >= 0 && connect(s, ai->ai_addr, ai->ai_addrlen) == 0;
-    if (s >= 0) close(s);
+    if (s >= 0) close_socket(s);
     freeaddrinfo(ai);
     return ok;
 }
@@ -156,13 +157,14 @@ static std::string raw_upload_with_filename(const std::string& sender, const Key
 
     addrinfo* ai = nullptr; getaddrinfo("127.0.0.1", std::to_string(PORT).c_str(), nullptr, &ai);
     int s = socket(AF_INET, SOCK_STREAM, 0); connect(s, ai->ai_addr, ai->ai_addrlen); freeaddrinfo(ai);
+    { std::vector<uint8_t> seen; std::string e; securechannel::secure_client(s, {}, seen, e); }  // every relay connection is encrypted (M8)
     send_message(s, MessageType::UPLOAD_REQUEST, serialize_file_header(h));
     auto ack = recv_message(s, 4096); std::string id(ack->payload.begin(), ack->payload.end());
     std::string caad = "pq-file-transfer v2 chunk";
     std::vector<uint8_t> a(caad.begin(), caad.end()); write_u32(a, 0); a.push_back(1);
     FileChunk c{0, CryptoEngine::encrypt(keys.data_key, h.nonce, data, a)};
     send_message(s, MessageType::UPLOAD_CHUNK, serialize_file_chunk(c));
-    send_message(s, MessageType::UPLOAD_DONE, {}); recv_message(s, 4096); close(s);
+    send_message(s, MessageType::UPLOAD_DONE, {}); recv_message(s, 4096); close_socket(s);
     return id;
 }
 

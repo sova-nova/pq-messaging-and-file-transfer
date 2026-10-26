@@ -1,4 +1,5 @@
 #include "relay_client.h"
+#include "secure_channel.h"
 
 #include "messages.h"
 #include "protocol.h"
@@ -60,6 +61,15 @@ bool RelayClient::connect(const std::string& host, uint16_t port, const std::vec
     if (sock_ == INVALID_SOCKET_VAL) {
         error = describe_connect_failure("relay", host + ":" + std::to_string(port), failure);
         return false;
+    }
+
+    // Encrypted from here on (M8), and the relay proves it holds the pinned key before anything is sent.
+    {
+        std::vector<uint8_t> seen;
+        if (!securechannel::secure_client(sock_, expected_relay_id, seen, error)) {
+            close();
+            return false;
+        }
     }
 
     relay::Hello hello;

@@ -17,6 +17,17 @@ class TransferEngine {
 public:
     TransferEngine() = default;
 
+    // The relay's ID to insist on for the next transfers (empty: accept any relay, and remember what it was: see relay_seen).
+    void set_trusted_relay(const std::vector<uint8_t>& relay_id) {
+        std::lock_guard<std::mutex> lock(relay_mutex_);
+        trusted_relay_ = relay_id;
+    }
+    // The ID of the relay the last connection was encrypted with (empty if none got that far).
+    std::vector<uint8_t> relay_seen() const {
+        std::lock_guard<std::mutex> lock(relay_mutex_);
+        return relay_seen_;
+    }
+
     // Encrypts `filepath` (UTF-8) for `recipient`, signs it with this user's
     // ML-DSA key and uploads it to the relay.
     void upload_file(const std::string& filepath,
@@ -46,6 +57,8 @@ public:
     std::function<void(const std::string& transfer_id)> on_transfer_id;
 
 private:
+    mutable std::mutex relay_mutex_;
+    std::vector<uint8_t> trusted_relay_, relay_seen_;
     const KeyStore* keystore_ = nullptr;
     const KeyStore& active_keystore(std::unique_ptr<KeyStore>& fallback) const;
 

@@ -24,7 +24,8 @@
     #define SEND_FLAGS 0
     #define SHUTDOWN_BOTH SD_BOTH
 
-    inline void close_socket(socket_t s) { closesocket(s); }
+    void detach_frame_cipher(socket_t s);  // protocol.cpp: a closed socket's cipher is forgotten (its number may be reused)
+    inline void close_socket(socket_t s) { detach_frame_cipher(s); closesocket(s); }
 
     inline int platform_init() {
         WSADATA wsaData;
@@ -65,7 +66,8 @@
         #define SEND_FLAGS 0
     #endif
 
-    inline void close_socket(socket_t s) { close(s); }
+    void detach_frame_cipher(socket_t s);  // protocol.cpp: a closed socket's cipher is forgotten (its number may be reused)
+    inline void close_socket(socket_t s) { detach_frame_cipher(s); close(s); }
 
     inline int platform_init() {
         std::signal(SIGPIPE, SIG_IGN);

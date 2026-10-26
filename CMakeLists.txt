@@ -18,6 +18,16 @@ option(PQ_BUILD_CLIENT "Build the Qt client" ON)
 option(PQ_REQUIRE_KEYCHAIN "Fail if QtKeychain is not found" OFF)
 # Tests need liboqs and SQLite. Run them with: ctest --test-dir build --output-on-failure
 option(PQ_BUILD_TESTS "Build the test suite" OFF)
+# Build everything with AddressSanitizer and UndefinedBehaviorSanitizer (GCC or Clang), to catch memory errors, undefined
+# behaviour and leaks while the tests run. Slower, and each file needs a lot of memory to compile: use few parallel jobs.
+option(PQ_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if(PQ_SANITIZE)
+    if(MSVC)
+        message(FATAL_ERROR "PQ_SANITIZE needs GCC or Clang")
+    endif()
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL 1.1.1 REQUIRED)
@@ -230,6 +240,30 @@ if(PQ_BUILD_TESTS)
         pq_warnings(pq-test-group)
         add_dependencies(pq-test-group pq-server)
         add_test(NAME group COMMAND pq-test-group $<TARGET_FILE:pq-server>)
-        set_tests_properties(group PROPERTIES TIMEOUT 600)
+        set_tests_properties(group PROPERTIES TIMEOUT 1800)  # about 12 minutes normally; much longer with PQ_SANITIZE
     endif()
+endif()
+
+# Fuzzing (M8): every parser of someone else's data, through one input format (see fuzz/fuzz_targets.h).
+# pq-fuzz is a simple mutation fuzzer that works with any compiler (build it with PQ_SANITIZE on for it to catch memory
+# errors); a short run is one of the tests. With clang, -DPQ_FUZZ=ON also builds pq-libfuzzer, the same targets under
+# libFuzzer, which is coverage-guided and far better at finding deep bugs: run it for hours, e.g.
+#   ./pq-libfuzzer -max_total_time=3600 corpus/
+if(PQ_BUILD_TESTS AND NOT WIN32)
+    add_executable(pq-fuzz fuzz/driver.cpp fuzz/fuzz_targets.cpp)
+    target_link_libraries(pq-fuzz PRIVATE pq_core)
+    target_include_directories(pq-fuzz PRIVATE ${CMAKE_SOURCE_DIR}/fuzz ${CMAKE_SOURCE_DIR}/protocol)
+    add_test(NAME fuzz_smoke COMMAND pq-fuzz --seconds 20 --crash-file ${CMAKE_BINARY_DIR}/pq-fuzz-crash.bin)
+    set_tests_properties(fuzz_smoke PROPERTIES TIMEOUT 120)
+endif()
+option(PQ_FUZZ "Build the libFuzzer target (clang only)" OFF)
+if(PQ_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "PQ_FUZZ needs clang (libFuzzer)")
+    endif()
+    add_executable(pq-libfuzzer fuzz/libfuzzer_main.cpp fuzz/fuzz_targets.cpp)
+    target_link_libraries(pq-libfuzzer PRIVATE pq_core)
+    target_include_directories(pq-libfuzzer PRIVATE ${CMAKE_SOURCE_DIR}/fuzz ${CMAKE_SOURCE_DIR}/protocol)
+    target_compile_options(pq-libfuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_options(pq-libfuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
 endif()

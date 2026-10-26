@@ -23,6 +23,7 @@
 
 #include "protocol.h"
 #include "relay_service.h"
+#include "secure_channel.h"
 #include "scope_exit.h"
 
 #ifndef _WIN32
@@ -346,6 +347,9 @@ static void handle_client(socket_t sock, std::string peer_ip) {
     disable_sigpipe(sock);
 
     try {
+        // Every connection is encrypted (M8): the handshake comes first, before any message of either protocol. A client that
+        // doesn't do it (an older app) is simply closed.
+        if (!securechannel::secure_server(sock, g_relay->identity())) return;
         auto first = recv_message(sock, MAX_HEADER_MESSAGE);
         if (!first) return;
 

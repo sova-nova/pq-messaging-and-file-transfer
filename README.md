@@ -183,6 +183,8 @@ The first columns of `--list-mailboxes` are the IDs to use (at least 8 character
 
 **Sending files in a chat.** Press **Attach…** next to the message box to send a file to the person or group you are talking to; anything you have typed goes with it as a caption. The file is encrypted on your computer, uploaded to your relay, and each recipient gets their own one-time download token. It reaches them only once the upload has finished, so a relay that is down just means waiting. Nothing is ever downloaded automatically: a recipient sees the file's name and size, double-clicks it, chooses a folder, and the app saves it there under a name that can't replace anything, after checking it against what you signed. The relay deletes its copy when everyone has it, when you withdraw it (double-click the file, then **Withdraw it**), or when the days you chose run out. You see how many have it ("1 of 2 have it"). The limits are the relay's: by default 1 GiB per file, 4 GiB stored per mailbox, kept up to 30 days (`--max-attachment-mib`, `--attachment-quota-mib`, `--attachment-max-days`). A chat restored from its archive shows its attachments but can't fetch them, because the key is never in the archive.
 
+**Encrypted connections.** Everything between the app and a relay is encrypted, and the relay must prove its identity before anything is sent: invites, send tokens, which mailbox signs in and what is sent can't be read by anyone watching the network (they can still see that you are talking to the relay, and roughly how much). A relay no longer needs to sit behind a VPN for this. The Files tab trusts the same relay as messaging when it is the same address, and otherwise remembers the relay it first connected to and refuses one whose identity has changed. An app or relay from before this version can't connect to one from after it: update them together.
+
 **Checking it from the outside.** `pq-relay-check` confirms a relay is reachable and genuine from wherever you run it, through the tunnel and the firewall:
 
 ```bash
@@ -343,3 +345,7 @@ The release workflow runs the same tests against the real liboqs before it publi
 ## Protocol version
 
 This is protocol version 2. It is not compatible with v1: the sender and recipient clients and the server all need to be updated together.
+
+## Security
+
+See **`SECURITY.md`** for what the suite protects against and what it doesn't, guidance for relay operators, and how to report a problem privately. **`REVIEW.md`** is the packet prepared for an independent security review, which has not happened yet.

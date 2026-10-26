@@ -1081,7 +1081,8 @@ int main(int argc, char** argv) {
             CHECK(bob.engine->save_keyring(err), "Bob's keyring is stored on the relay, encrypted (" + err + ")");
 
             // A damaged keyring is refused, with a reason; a good one can be stored over it.
-            sql_exec(ROOT / "relay-data/s/v3/relay.db", "UPDATE keyrings SET blob = zeroblob(200)");
+            // Only Bob's: an UPDATE without WHERE once damaged every user's keyring, which went unnoticed while no one else had stored one yet.
+            sql_exec(ROOT / "relay-data/s/v3/relay.db", "UPDATE keyrings SET blob = zeroblob(200) WHERE mailbox_id = " + hex_literal(bob.keys->load_mailbox_config()->mailbox_id));
             MessagingEngine::RestoreReport bad;
             CHECK(!bob.engine->restore_from_relay(bad, err) && !bad.found && has(err, "could not be opened"), "a keyring that has been damaged on the relay is refused: " + err);
             CHECK(bob.engine->save_keyring(err), "(Bob stores a good one again)");
@@ -1468,6 +1469,8 @@ int main(int argc, char** argv) {
 
         // --- Nothing to restore from ---
         restart_engine(mallory);
+        // Her app may have stored a keyring by now (it holds the send token she gave Bob): take it away, so this is a mailbox with none.
+        sql_exec(ROOT / "relay-data/s/v3/relay.db", "DELETE FROM keyrings WHERE mailbox_id = " + hex_literal(mallory.keys->load_mailbox_config()->mailbox_id));
         MessagingEngine::RestoreReport none;
         CHECK(!mallory.engine->restore_from_relay(none, err) && !none.found && has(err, "no saved keyring"), "restoring a mailbox that never saved a keyring says so plainly: " + err);
     }
@@ -1695,6 +1698,10 @@ int main(int argc, char** argv) {
         fs::remove_all(work);
     }
 
+    // Every engine is shut down (its background threads stopped) before main returns. Left to the static map, they would only be
+    // destroyed after OpenSSL's own exit-time cleanup had run, which leaves those threads' OpenSSL state behind (LeakSanitizer
+    // reports it) and would be unsafe if a thread were still using OpenSSL at that point.
+    for (auto& [name, u] : users) u->engine.reset();
     srv.stop();
     std::error_code ec;
     fs::remove_all(ROOT, ec);

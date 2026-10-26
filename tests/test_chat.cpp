@@ -234,7 +234,7 @@ int main(int argc, char** argv) {
 
         RelayInvite wrong = *first_invite;
         wrong.relay_id[0] ^= 1;
-        CHECK(!alice.engine->setup(wrong, err) && has(err, "does not match") && !alice.engine->is_set_up(), "an invite naming a different relay key is refused: " + err);
+        CHECK(!alice.engine->setup(wrong, err) && (has(err, "does not match") || has(err, "identity has changed")) && !alice.engine->is_set_up(), "an invite naming a different relay key is refused: " + err);
         CHECK(alice.engine->setup(*first_invite, err) && alice.engine->is_set_up(), "setting up with a good invite works (" + err + ")");
         auto cfg = alice.keys->load_mailbox_config();
         CHECK(cfg && cfg->relay_id == relay_id && cfg->mailbox_id.size() == 16 && alice.keys->has_access_key(), "the mailbox and its access key are saved");

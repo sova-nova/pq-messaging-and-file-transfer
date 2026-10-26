@@ -14,6 +14,7 @@
 
 #include "platform.h"
 #include "relay_store.h"
+#include "crypto_engine.h"
 
 namespace relay {
 
@@ -107,6 +108,10 @@ private:
     };
 
     void load_or_create_identity(const std::filesystem::path& data_dir);
+public:
+    // The relay's identity key: it signs every connection's encrypted handshake.
+    CryptoEngine::SigKeyPair identity() const { return CryptoEngine::SigKeyPair{public_key_, private_key_}; }
+private:
     std::filesystem::path file_path(const Bytes& file_id, const char* extension) const;
     void remove_file_bytes(const Bytes& file_id);
     std::filesystem::path files_dir_;

@@ -1,4 +1,5 @@
 #include "transfer_engine.h"
+#include "secure_channel.h"
 
 #include "crypto_engine.h"
 #include "protocol.h"
@@ -236,7 +237,24 @@ socket_t TransferEngine::connect_to_server(const std::string& host, uint16_t por
             std::lock_guard<std::mutex> lock(socket_mutex_);
             active_socket_ = sock;
         }
-        if (::connect(sock, ai->ai_addr, static_cast<socklen_t>(ai->ai_addrlen)) == 0) return sock;
+        if (::connect(sock, ai->ai_addr, static_cast<socklen_t>(ai->ai_addrlen)) == 0) {
+            // Encrypted from here on (M8), with the relay proving it holds the trusted key (or, the first time, telling us which).
+            std::vector<uint8_t> trusted, seen;
+            {
+                std::lock_guard<std::mutex> lock(relay_mutex_);
+                trusted = trusted_relay_;
+            }
+            std::string error;
+            if (!securechannel::secure_client(sock, trusted, seen, error)) {
+                release_socket(sock);
+                throw TransferError(error);
+            }
+            {
+                std::lock_guard<std::mutex> lock(relay_mutex_);
+                relay_seen_ = seen;
+            }
+            return sock;
+        }
         failure = last_socket_error();  // read before release_socket can change it
         release_socket(sock);
     }
