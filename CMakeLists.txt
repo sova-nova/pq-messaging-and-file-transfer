@@ -133,6 +133,7 @@ if(PQ_BUILD_CLIENT)
         client/keychain.cpp
         client/chat_widget.h
         client/chat_widget.cpp
+        client/message_view.cpp
     )
     target_link_libraries(pq-client PRIVATE pq_core Qt6::Core Qt6::Gui Qt6::Widgets)
     pq_warnings(pq-client)

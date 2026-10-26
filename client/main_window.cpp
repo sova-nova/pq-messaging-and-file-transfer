@@ -4,6 +4,7 @@
 #include "chat_widget.h"
 #include "key_dialogs.h"
 #include "keychain.h"
+#include "protocol.h"  // bytes_to_hex, hex_to_bytes (the Files tab's remembered relay IDs)
 
 #include <QAction>
 #include <QClipboard>

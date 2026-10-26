@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "messaging_engine.h"
+#include "message_view.h"
 
 class QCheckBox;
 class QLabel;
@@ -55,8 +56,7 @@ private:
     void render_private_messages(bool force_scroll);
     void select_private(const QString& chat_id);
     void start_private_chat();
-    void copy_selected_messages();
-    void open_details(QListWidgetItem* item);
+    bool open_details(const MessageLine& line);
     void report_unread();
     void show_attachment(const QString& file_id);
     void review_deletions();
@@ -97,7 +97,6 @@ private:
     std::function<void(const QString&)> on_relay_chosen_;
     std::function<void(size_t)> on_unread_changed_;
     size_t last_unread_ = static_cast<size_t>(-1);
-    QString selection_scope_;  // which chat the highlighted messages belong to, so a highlight never carries over to another chat
     bool animating_ = false;                 // an upload or download is under way: redraw now and then to show its progress
     QPushButton* deletions_button_ = nullptr;     // requests from others to delete a chat or messages
     QPushButton* delete_chat_button_ = nullptr;   // ask everyone to delete the chat on screen
@@ -112,7 +111,7 @@ private:
     QCheckBox* read_box_ = nullptr;
     QPushButton* revoke_button_ = nullptr;
     QPushButton* people_button_ = nullptr;  // "Members…" for a group, "Verify…" for a contact
-    QListWidget* messages_ = nullptr;
+    MessageView* messages_ = nullptr;  // the chat on screen, as selectable text (G1)
     QLineEdit* input_ = nullptr;
     QPushButton* send_button_ = nullptr;
     QTimer* timer_ = nullptr;
