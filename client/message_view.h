@@ -8,7 +8,9 @@
 
 // One message as the chat shows it.
 struct MessageLine {
-    QString text;            // what is shown: always plain text, never HTML or links
+    QString text;            // the whole message as one line of plain text (what a plain view would show)
+    QString meta;            // shown in a box (UX step 8): a small line on top, "You · 20 Oct 23:01 · read" ...
+    QString body;            // ... and the message itself beneath it. Both empty: `text` is shown plainly, without a box
     bool outgoing = false;   // ours (on the right) or theirs (on the left)
     QString copy_text;       // what "Copy message" puts on the clipboard (empty: the text as shown)
     QString attachment_id;   // an attachment: double-click shows what can be done with it

@@ -1,5 +1,8 @@
 #include "main_window.h"
 #include "scope_exit.h"
+#include "app_style.h"
+#include "chat_entry.h"
+#include "icons.h"
 #include "crypto_engine.h"
 #include "chat_widget.h"
 #include "key_dialogs.h"
@@ -7,6 +10,15 @@
 #include "protocol.h"  // bytes_to_hex, hex_to_bytes (the Files tab's remembered relay IDs)
 
 #include <QAction>
+#include <QSizePolicy>
+#include <QTimer>
+#include <QStackedWidget>
+#include <QRadioButton>
+#include <QTabBar>
+#include <QListWidget>
+#include <QPlainTextEdit>
+#include <QGroupBox>
+#include <QDialog>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDesktopServices>
@@ -96,17 +108,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     // Two tabs: the existing file transfer, and chats. Everything below up to the Chats tab is the
     // Files page, built into `layout`.
     auto* tabs = new QTabWidget(this);
+    tabs_ = tabs;
     setCentralWidget(tabs);
     auto* files_page = new QWidget(tabs);
+    files_page_ = files_page;
     auto* layout = new QVBoxLayout(files_page);
     tabs->addTab(files_page, "Files");
 
-    auto* title = new QLabel("PQ File Transfer", this);
-    title->setAlignment(Qt::AlignCenter);
-    title->setStyleSheet("font-size: 18px; font-weight: bold;");
-    layout->addWidget(title);
-
     status_label_ = plain_label("Status: Ready", this);
+    status_label_->setProperty("role", "muted");
 
     std::string key_problem;
     try {
@@ -127,27 +137,42 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     }
     engine_.set_keystore(keystore_.get());  // transfers use the unlocked keys held by the app
 
-    // --- Identity ---
-    auto* fingerprint_hint = plain_label("Your fingerprint. Contacts should check it with you before trusting your keys:", this);
-    fingerprint_hint->setAlignment(Qt::AlignCenter);  // centered like the fingerprint beneath it
-    layout->addWidget(fingerprint_hint);
-    fingerprint_label_ = plain_label(formatted_fingerprint(keystore_->own_fingerprint()), this);
+    // --- Settings (UX step 3): your identity and key protection live here, off the main screens. The widgets are the same ones
+    // as before, so everything that updates or enables them still does. Messaging extras are added once the Chats tab exists.
+    settings_dialog_ = new QDialog(this);
+    settings_dialog_->setWindowTitle("Settings");
+    settings_dialog_->setMinimumWidth(560);
+    settings_layout_ = new QVBoxLayout(settings_dialog_);
+    auto* identity_box = new QGroupBox("Your identity", settings_dialog_);
+    auto* identity_box_layout = new QVBoxLayout(identity_box);
+    settings_layout_->addWidget(identity_box);
+    auto* fingerprint_hint = plain_label("Your fingerprint. Contacts check it with you (in person or on a call) before trusting your keys:", identity_box);
+    fingerprint_hint->setWordWrap(true);
+    identity_box_layout->addWidget(fingerprint_hint);
+    fingerprint_label_ = plain_label(formatted_fingerprint(keystore_->own_fingerprint()), identity_box);
     fingerprint_label_->setAlignment(Qt::AlignCenter);
     fingerprint_label_->setStyleSheet("font-family: monospace;");
     fingerprint_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    layout->addWidget(fingerprint_label_);
+    identity_box_layout->addWidget(fingerprint_label_);
 
     auto* identity_layout = new QHBoxLayout();
-    copy_card_button_ = new QPushButton("Copy My Contact Card", this);
+    copy_card_button_ = new QPushButton("Copy my contact card", identity_box);
     copy_card_button_->setToolTip("One line of text to send to a contact so they can add you");
-    export_keys_button_ = new QPushButton("Export Key Files…", this);
+    auto* save_card_button = new QPushButton("Save card as file…", identity_box);
+    connect(save_card_button, &QPushButton::clicked, this, [this] { save_contact_card(); });
+    export_keys_button_ = new QPushButton("Export key files…", identity_box);
+    export_keys_button_->setToolTip("The older way to share your public keys: two files instead of a card");
     identity_layout->addWidget(copy_card_button_);
+    identity_layout->addWidget(save_card_button);
     identity_layout->addWidget(export_keys_button_);
-    layout->addLayout(identity_layout);
+    identity_box_layout->addLayout(identity_layout);
 
-    key_status_label_ = plain_label("", this);
-    layout->addWidget(key_status_label_);
-    key_protection_button_ = new QPushButton("Key Protection…", this);
+    auto* keys_box = new QGroupBox("Key protection", settings_dialog_);
+    auto* keys_box_layout = new QVBoxLayout(keys_box);
+    settings_layout_->addWidget(keys_box);
+    key_status_label_ = plain_label("", keys_box);
+    keys_box_layout->addWidget(key_status_label_);
+    key_protection_button_ = new QPushButton("Change key protection…", keys_box);
     auto* key_menu = new QMenu(key_protection_button_);
     QAction* set_action = key_menu->addAction("Set a passphrase…");
     QAction* change_action = key_menu->addAction("Change passphrase…");
@@ -166,68 +191,134 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         forget_action->setEnabled(protected_keys && keychain::available());
     });
     key_protection_button_->setMenu(key_menu);
-    layout->addWidget(key_protection_button_);
+    keys_box_layout->addWidget(key_protection_button_);
+
+    // On the Files tab, one line about the keys, and only while they aren't protected.
+    key_warning_ = new QWidget(files_page);
+    key_warning_->setProperty("role", "warning-banner");
+    key_warning_->setAttribute(Qt::WA_StyledBackground, true);
+    auto* key_warning_layout = new QHBoxLayout(key_warning_);
+    key_warning_layout->setContentsMargins(12, 6, 6, 6);
+    auto* key_warning_text = plain_label("Your keys aren't protected by a passphrase: anyone who copies this computer's files could use them.", key_warning_);
+    key_warning_text->setWordWrap(true);
+    auto* protect_button = new QPushButton("Protect now…", key_warning_);
+    protect_button->setProperty("role", "warning");
+    connect(protect_button, &QPushButton::clicked, this, [this] { set_passphrase_action(); });
+    key_warning_layout->addWidget(key_warning_text, 1);
+    key_warning_layout->addWidget(protect_button);
+    // (Shown on Home: build_home places it there.)
     update_key_status();
     layout->addSpacing(10);
 
-    // --- Server ---
-    auto* server_layout = new QHBoxLayout();
-    server_layout->addWidget(new QLabel("Relay server:", this));
-    server_edit_ = new QLineEdit(QSettings().value(SERVER_SETTING, DEFAULT_SERVER).toString(), this);
-    server_edit_->setPlaceholderText("host:port");
-    server_layout->addWidget(server_edit_, 1);
-    layout->addLayout(server_layout);
-
-    // --- Recipient ---
+    // --- The Files tab (UX step 4): two cards side by side, then what is happening, then the relay and Downloads. ---
+    auto* cards = new QHBoxLayout();
+    auto* send_box = new QGroupBox("Send a file", files_page);
+    auto* send_layout = new QVBoxLayout(send_box);
+    auto* send_text = plain_label("Encrypted so only the person you choose can open it. You'll get a link to give them.", send_box);
+    send_text->setWordWrap(true);
+    send_layout->addWidget(send_text);
     auto* recipient_layout = new QHBoxLayout();
-    recipient_layout->addWidget(new QLabel("Send to:", this));
-    recipient_combo_ = new QComboBox(this);
+    recipient_layout->addWidget(plain_label("Send to:", send_box));
+    recipient_combo_ = new QComboBox(send_box);
     recipient_combo_->setMinimumWidth(150);
     recipient_layout->addWidget(recipient_combo_, 1);
-    add_contact_button_ = new QPushButton("+", this);
-    add_contact_button_->setToolTip("Add contact");
-    add_contact_button_->setMaximumWidth(30);
-    remove_contact_button_ = new QPushButton("−", this);
-    remove_contact_button_->setToolTip("Remove selected contact");
-    remove_contact_button_->setMaximumWidth(30);
-    recipient_layout->addWidget(add_contact_button_);
+    remove_contact_button_ = new QPushButton("Remove…", send_box);
+    remove_contact_button_->setToolTip("Remove the selected contact and their keys");
     recipient_layout->addWidget(remove_contact_button_);
-    layout->addLayout(recipient_layout);
-
-    // --- Actions ---
-    send_button_ = new QPushButton("Send File", this);
-    receive_button_ = new QPushButton("Receive File", this);
-    cancel_button_ = new QPushButton("Cancel", this);
+    send_layout->addLayout(recipient_layout);
+    add_contact_button_ = new QPushButton("Someone new? Add a contact…", send_box);
+    add_contact_button_->setProperty("role", "link");
+    add_contact_button_->setToolTip("Swap contact cards with someone so you can send each other files and messages");
+    send_layout->addWidget(add_contact_button_, 0, Qt::AlignLeft);
+    send_layout->addStretch(1);
+    send_button_ = new QPushButton("Choose file and send…", send_box);
+    send_button_->setProperty("role", "primary");
+    send_button_->setIcon(app_icon("upload", QColor("#ffffff")));
     send_button_->setMinimumHeight(40);
-    receive_button_->setMinimumHeight(40);
-    cancel_button_->setEnabled(false);
-    layout->addWidget(send_button_);
-    layout->addWidget(receive_button_);
-    layout->addWidget(cancel_button_);
-    layout->addSpacing(10);
+    send_layout->addWidget(send_button_);
+    cards->addWidget(send_box, 1);
 
-    progress_bar_ = new QProgressBar(this);
+    auto* receive_box = new QGroupBox("Receive a file", files_page);
+    auto* receive_layout = new QVBoxLayout(receive_box);
+    auto* receive_text = plain_label("Paste the link someone sent you. The file is checked before it's saved to your Downloads folder.", receive_box);
+    receive_text->setWordWrap(true);
+    receive_layout->addWidget(receive_text);
+    receive_edit_ = new QLineEdit(receive_box);
+    receive_edit_->setPlaceholderText("Paste the link or transfer ID here");
+    receive_layout->addWidget(receive_edit_);
+    receive_layout->addStretch(1);
+    receive_button_ = new QPushButton("Download", receive_box);
+    receive_button_->setIcon(app_icon("download"));
+    receive_button_->setMinimumHeight(40);
+    receive_layout->addWidget(receive_button_);
+    cards->addWidget(receive_box, 1);
+    layout->addLayout(cards);
+    connect(receive_edit_, &QLineEdit::returnPressed, this, [this] { receive_button_->click(); });
+
+    // Progress and Cancel, only while a transfer runs.
+    progress_row_ = new QWidget(files_page);
+    auto* progress_layout = new QHBoxLayout(progress_row_);
+    progress_layout->setContentsMargins(0, 0, 0, 0);
+    progress_bar_ = new QProgressBar(progress_row_);
     progress_bar_->setRange(0, 100);
     progress_bar_->setValue(0);
-    layout->addWidget(progress_bar_);
+    cancel_button_ = new QPushButton("Cancel", progress_row_);
+    cancel_button_->setEnabled(false);
+    progress_layout->addWidget(progress_bar_, 1);
+    progress_layout->addWidget(cancel_button_);
+    progress_row_->setVisible(false);
+    layout->addWidget(progress_row_);
 
-    transfer_id_label_ = plain_label("", this);
-    transfer_id_label_->setAlignment(Qt::AlignCenter);
+    // The link to give, once a send has one.
+    result_box_ = new QGroupBox("Ready to share", files_page);
+    auto* result_layout = new QVBoxLayout(result_box_);
+    transfer_id_label_ = plain_label("", result_box_);
+    transfer_id_label_->setWordWrap(true);
     transfer_id_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    layout->addWidget(transfer_id_label_);
-
+    result_layout->addWidget(transfer_id_label_);
     auto* util_layout = new QHBoxLayout();
-    copy_link_button_ = new QPushButton("Copy Share Link", this);
+    copy_link_button_ = new QPushButton("Copy link", result_box_);
+    copy_link_button_->setProperty("role", "primary");
     copy_link_button_->setEnabled(false);
-    copy_id_button_ = new QPushButton("Copy Transfer ID", this);
+    copy_id_button_ = new QPushButton("Copy transfer ID instead", result_box_);
+    copy_id_button_->setProperty("role", "link");
     copy_id_button_->setEnabled(false);
     util_layout->addWidget(copy_link_button_);
     util_layout->addWidget(copy_id_button_);
-    layout->addLayout(util_layout);
-    open_downloads_button_ = new QPushButton("Open Downloads", this);
-    layout->addWidget(open_downloads_button_);
+    util_layout->addStretch(1);
+    result_layout->addLayout(util_layout);
+    result_box_->setVisible(false);
+    layout->addWidget(result_box_);
 
     layout->addStretch();
+
+    // The relay (one line; Change turns it into a box), and Downloads.
+    auto* footer = new QHBoxLayout();
+    relay_label_ = plain_label("", files_page);
+    relay_label_->setWordWrap(false);  // "Using relay host:port" fits on one line
+    server_edit_ = new QLineEdit(QSettings().value(SERVER_SETTING, DEFAULT_SERVER).toString(), files_page);
+    server_edit_->setPlaceholderText("host:port");
+    server_edit_->setVisible(false);
+    change_relay_button_ = new QPushButton("Change", files_page);
+    change_relay_button_->setToolTip("The relay files are sent through");
+    footer->addWidget(relay_label_);
+    footer->addWidget(server_edit_, 1);
+    footer->addWidget(change_relay_button_);
+    footer->addStretch(1);
+    open_downloads_button_ = new QPushButton("Open Downloads folder", files_page);
+    footer->addWidget(open_downloads_button_);
+    layout->addLayout(footer);
+    connect(change_relay_button_, &QPushButton::clicked, this, [this] {
+        const bool start_editing = server_edit_->isHidden();
+        if (!start_editing) save_server_setting();
+        server_edit_->setVisible(start_editing);
+        relay_label_->setVisible(!start_editing);
+        change_relay_button_->setText(start_editing ? "Done" : "Change");
+        if (start_editing) server_edit_->setFocus();
+    });
+    connect(server_edit_, &QLineEdit::returnPressed, this, [this] { if (!server_edit_->isHidden()) change_relay_button_->click(); });
+    update_relay_label();
+
     layout->addWidget(status_label_);
 
     refresh_contacts();
@@ -267,16 +358,71 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     // The Chats tab owns the messaging engine and its worker thread.
     chat_widget_ = new ChatWidget(*keystore_, keystore_->app_dir() / "history.db", tabs);
     const int chats_tab = tabs->addTab(chat_widget_, "Chats");
+
+    // Settings, reachable from either tab; its messaging part works through the Chats tab's own actions.
+    auto* settings_button = new QPushButton("Settings…", tabs);
+    settings_button->setIcon(app_icon("settings"));
+    settings_button->setToolTip("Your fingerprint and contact card, key protection, relay invites, issued cards, restoring history");
+    tabs->setCornerWidget(settings_button, Qt::TopRightCorner);
+    connect(settings_button, &QPushButton::clicked, this, [this] { open_settings(); });
+    auto* messaging_box = new QGroupBox("Messaging", settings_dialog_);
+    auto* messaging_box_layout = new QVBoxLayout(messaging_box);
+    settings_messaging_status_ = plain_label("", messaging_box);
+    settings_messaging_status_->setWordWrap(true);
+    messaging_box_layout->addWidget(settings_messaging_status_);
+    auto* messaging_buttons = new QHBoxLayout();
+    settings_setup_button_ = new QPushButton("Set up messaging…", messaging_box);
+    settings_invites_button_ = new QPushButton("Relay invites…", messaging_box);
+    settings_invites_button_->setToolTip("Make a one-time invite so a friend can use this relay (you are vouching for them)");
+    settings_cards_button_ = new QPushButton("Cards issued…", messaging_box);
+    settings_cards_button_->setToolTip("Every contact card you've handed out, whether it's been used, and by whom");
+    settings_restore_button_ = new QPushButton("Restore history…", messaging_box);
+    settings_restore_button_->setToolTip("After reinstalling: get your saved chats back from the relay");
+    for (QPushButton* b : {settings_setup_button_, settings_invites_button_, settings_cards_button_, settings_restore_button_}) messaging_buttons->addWidget(b);
+    messaging_buttons->addStretch(1);
+    messaging_box_layout->addLayout(messaging_buttons);
+    settings_layout_->addWidget(messaging_box);
+    // Each opens its own window: Settings closes first, so the two never stack up.
+    connect(settings_setup_button_, &QPushButton::clicked, this, [this] { settings_dialog_->accept(); chat_widget_->open_setup(); });
+    connect(settings_invites_button_, &QPushButton::clicked, this, [this] { settings_dialog_->accept(); chat_widget_->open_relay_invites(); });
+    connect(settings_cards_button_, &QPushButton::clicked, this, [this] { settings_dialog_->accept(); chat_widget_->open_cards_issued(); });
+    connect(settings_restore_button_, &QPushButton::clicked, this, [this] { settings_dialog_->accept(); chat_widget_->open_restore(); });
+    auto* close_row = new QHBoxLayout();
+    close_row->addStretch(1);
+    auto* close_button = new QPushButton("Close", settings_dialog_);
+    close_button->setDefault(true);
+    connect(close_button, &QPushButton::clicked, settings_dialog_, &QDialog::accept);
+    close_row->addWidget(close_button);
+    settings_layout_->addLayout(close_row);
     // Setting up messaging on a relay also sets the Files tab's relay to it.
+    chat_widget_->set_on_add_contact([this] { add_contact(); });
     chat_widget_->set_on_relay_chosen([this](const QString& server) {
         server_edit_->setText(server);
         save_server_setting();
     });
     // Something arrived while another tab was showing: say so on the Chats tab.
-    chat_widget_->set_on_unread_changed([tabs, chats_tab](size_t unread) {
-        tabs->setTabText(chats_tab, unread ? QString("Chats (%1)").arg(static_cast<qulonglong>(unread)) : QString("Chats"));
+    (void)chats_tab;  // tabs move (Home comes first), so the Chats tab is looked up each time
+    chat_widget_->set_on_unread_changed([this](size_t unread) {
+        tabs_->setTabText(tabs_->indexOf(chat_widget_), unread ? QString("Chats (%1)").arg(static_cast<qulonglong>(unread)) : QString("Chats"));
     });
-    connect(tabs, &QTabWidget::currentChanged, this, [this](int) { chat_widget_->refresh_now(); });  // shown again: what was waiting is seen
+    connect(tabs, &QTabWidget::currentChanged, this, [this](int) {
+        chat_widget_->refresh_now();
+        refresh_home();
+    });
+    build_home();
+    chat_widget_->set_on_changed([this] { refresh_home(); });
+    // What a new user chose in the first-run guide, now that the window (and the Chats tab) exist.
+    if (!pending_invite_.isEmpty() || pending_add_contact_) {
+        QTimer::singleShot(0, this, [this] {
+            const QString invite = pending_invite_;
+            pending_invite_.clear();
+            if (!invite.isEmpty()) chat_widget_->setup_with_invite(invite);
+            if (pending_add_contact_) {
+                pending_add_contact_ = false;
+                add_contact();
+            }
+        });
+    }  // shown again: what was waiting is seen
 }
 
 MainWindow::~MainWindow() {
@@ -308,21 +454,163 @@ void MainWindow::remember_passphrase(const std::string& passphrase) {
 }
 
 // Runs before the window is shown: creates, validates and (if needed) unlocks the keys.
+// The first-run guide: five steps in one window, each checked before moving on. Closing it before the end cancels set-up.
+bool MainWindow::run_first_run_guide(FirstRunChoices& out) {
+    QDialog dialog(this);
+    dialog.setWindowTitle("Welcome to PQ File Transfer");
+    dialog.setMinimumWidth(580);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* step_label = plain_label("", &dialog);
+    layout->addWidget(step_label);
+    auto* pages = new QStackedWidget(&dialog);
+    layout->addWidget(pages, 1);
+    auto page = [&](const QString& title, const QString& text) {
+        auto* w = new QWidget(pages);
+        auto* l = new QVBoxLayout(w);
+        auto* t = plain_label(title, w);
+        t->setStyleSheet("font-size: 18px; font-weight: bold;");
+        l->addWidget(t);
+        auto* body = plain_label(text, w);
+        body->setWordWrap(true);
+        l->addWidget(body);
+        pages->addWidget(w);
+        return l;
+    };
+
+    auto* welcome = page("Welcome", "Send files and messages that only the people you choose can read, protected by post-quantum "
+                                    "encryption.\n\nSetting up takes about a minute: your name, a passphrase for your keys, and, if "
+                                    "you have one, an invite for messaging.");
+    welcome->addStretch(1);
+
+    auto* name_page = page("Your name", "The name your contacts see on your contact card. You can change it whenever you make a new card.");
+    auto* name_edit = new QLineEdit(QSettings().value("display_name", default_display_name()).toString(), &dialog);
+    name_edit->setPlaceholderText("Your name");
+    name_page->addWidget(name_edit);
+    name_page->addStretch(1);
+
+    auto* protect_page = page("Protect your keys", "Your keys are what make your messages and files yours. A passphrase keeps them useless to "
+                                                   "anyone who copies this computer's files. It can't be recovered if you forget it.");
+    auto* protect_yes = new QRadioButton("Protect them with a passphrase (recommended)", &dialog);
+    auto* protect_no = new QRadioButton("Not now (you can do this later in Settings)", &dialog);
+    protect_yes->setChecked(true);
+    protect_page->addWidget(protect_yes);
+    protect_page->addWidget(protect_no);
+    protect_page->addStretch(1);
+
+    auto* connect_page = page("Connect for messaging", "Chats go through a relay: a server that passes on encrypted messages it can't read. "
+                                                       "Whoever runs one can give you an invite.");
+    auto* invite_yes = new QRadioButton("I have an invite", &dialog);
+    auto* invite_edit = new QLineEdit(&dialog);
+    invite_edit->setPlaceholderText("Paste it here: pqft-relay://…");
+    auto* invite_no = new QRadioButton("Not now: I'll just send files (you can set up messaging any time from Home)", &dialog);
+    invite_no->setChecked(true);
+    connect_page->addWidget(invite_yes);
+    connect_page->addWidget(invite_edit);
+    connect_page->addWidget(invite_no);
+    connect_page->addStretch(1);
+    connect(invite_edit, &QLineEdit::textEdited, &dialog, [invite_yes] { invite_yes->setChecked(true); });
+
+    auto* done_page = page("You're all set", "Next, add your first contact: you each share your contact card once, and check each "
+                                             "other's fingerprint. You'll find everything else on Home.");
+    done_page->addStretch(1);
+
+    auto* buttons = new QHBoxLayout();
+    auto* back = new QPushButton("Back", &dialog);
+    auto* next = new QPushButton("Get started", &dialog);
+    next->setProperty("role", "primary");
+    auto* go_home = new QPushButton("Go to Home", &dialog);
+    auto* add_first = new QPushButton("Add your first contact", &dialog);
+    add_first->setProperty("role", "primary");
+    next->setDefault(true);
+    buttons->addWidget(back);
+    buttons->addStretch(1);
+    buttons->addWidget(go_home);
+    buttons->addWidget(add_first);
+    buttons->addWidget(next);
+    layout->addLayout(buttons);
+
+    const int last = pages->count() - 1;
+    auto show_step = [=](int index) {
+        pages->setCurrentIndex(index);
+        step_label->setText(QString("Step %1 of %2").arg(static_cast<qulonglong>(index + 1)).arg(static_cast<qulonglong>(last + 1)));
+        back->setEnabled(index > 0);
+        next->setText(index == 0 ? "Get started" : "Next");
+        next->setVisible(index < last);
+        go_home->setVisible(index == last);
+        add_first->setVisible(index == last);
+        if (index == last) add_first->setDefault(true);
+        else next->setDefault(true);
+    };
+    connect(back, &QPushButton::clicked, &dialog, [=] { show_step(std::max(0, pages->currentIndex() - 1)); });
+    connect(next, &QPushButton::clicked, &dialog, [&, show_step] {
+        const int index = pages->currentIndex();
+        if (index == 1) {  // the name
+            const QString name = name_edit->text().trimmed();
+            if (name.isEmpty() || name.toUtf8().size() > 64) {
+                QMessageBox::warning(&dialog, "Your name", "Please enter a name of up to 64 bytes.");
+                return;
+            }
+            out.name = name;
+        } else if (index == 2) {  // key protection: the usual passphrase window, asked here
+            out.protect = protect_yes->isChecked();
+            std::fill(out.passphrase.begin(), out.passphrase.end(), '\0');
+            out.passphrase.clear();
+            if (out.protect) {
+                auto choice = ask_new_passphrase(&dialog, "Choose a passphrase", protection_explanation("Choose a passphrase for your keys."), false);
+                if (choice.outcome != DialogOutcome::Accepted) return;  // stay on this step
+                out.passphrase = choice.passphrase;
+                out.remember = choice.remember;
+                std::fill(choice.passphrase.begin(), choice.passphrase.end(), '\0');
+            }
+        } else if (index == 3) {  // the invite, checked now and used once the window is open
+            out.invite.clear();
+            if (invite_yes->isChecked()) {
+                const QString text = invite_edit->text().trimmed();
+                if (!parse_relay_invite(text.toStdString())) {
+                    QMessageBox::warning(&dialog, "Connect for messaging",
+                                         "That invite isn't valid. Paste it exactly as you were given it, or choose \"Not now\".");
+                    return;
+                }
+                out.invite = text;
+            }
+        }
+        show_step(index + 1);
+    });
+    connect(go_home, &QPushButton::clicked, &dialog, [&] {
+        out.add_contact = false;
+        dialog.accept();
+    });
+    connect(add_first, &QPushButton::clicked, &dialog, [&] {
+        out.add_contact = true;
+        dialog.accept();
+    });
+    show_step(0);
+    const bool finished = dialog.exec() == QDialog::Accepted;
+    if (!finished) {
+        std::fill(out.passphrase.begin(), out.passphrase.end(), '\0');
+        out.passphrase.clear();
+    }
+    return finished;
+}
+
 bool MainWindow::setup_keys(std::string& problem) {
     QSettings settings;
 
     if (!keystore_->keys_exist()) {
-        auto choice = ask_new_passphrase(this, "Welcome to PQ File Transfer",
-                                         protection_explanation("Let's set up your keys. Protect them with a passphrase?"),
-                                         true);
-        if (choice.outcome == DialogOutcome::Cancelled) {
+        // A new user: the first-run guide (UX step 6). The keys are made with its passphrase choice; its invite and
+        // "add your first contact" are acted on once the window exists.
+        FirstRunChoices choices;
+        if (!run_first_run_guide(choices)) {
             problem = "Setup was cancelled. Restart the app to set up your keys.";
             return false;
         }
-        const bool protect = choice.outcome == DialogOutcome::Accepted;
-        keystore_->initialize_keys(protect ? choice.passphrase : std::string());
+        keystore_->initialize_keys(choices.protect ? choices.passphrase : std::string());
         settings.setValue(KEY_PROTECTION_DECIDED, true);
-        if (protect && choice.remember) remember_passphrase(choice.passphrase);
+        if (choices.protect && choices.remember) remember_passphrase(choices.passphrase);
+        std::fill(choices.passphrase.begin(), choices.passphrase.end(), '\0');
+        settings.setValue("display_name", choices.name);
+        pending_invite_ = choices.invite;
+        pending_add_contact_ = choices.add_contact;
         return true;
     }
 
@@ -388,14 +676,154 @@ bool MainWindow::unlock_keys(std::string& problem) {
     }
 }
 
+// Home (UX step 5): where the app opens. What's going on, anything waiting, the four things people come to do, and recent chats.
+void MainWindow::build_home() {
+    home_page_ = new QWidget(tabs_);
+    auto* layout = new QVBoxLayout(home_page_);
+
+    auto* status_row = new QHBoxLayout();
+    home_status_ = plain_label("", home_page_);
+    home_status_->setWordWrap(true);
+    home_setup_button_ = new QPushButton("Set up messaging…", home_page_);
+    connect(home_setup_button_, &QPushButton::clicked, this, [this] { chat_widget_->open_setup(); });
+    status_row->addWidget(home_status_, 1);
+    status_row->addWidget(home_setup_button_);
+    layout->addLayout(status_row);
+
+    if (key_warning_) layout->addWidget(key_warning_);  // only while the keys aren't protected (update_key_status)
+
+    home_waiting_ = new QWidget(home_page_);
+    home_waiting_->setProperty("role", "info-banner");
+    home_waiting_->setAttribute(Qt::WA_StyledBackground, true);
+    auto* waiting_layout = new QHBoxLayout(home_waiting_);
+    waiting_layout->setContentsMargins(12, 6, 6, 6);
+    home_waiting_text_ = plain_label("", home_waiting_);
+    auto* review = new QPushButton("Review", home_waiting_);
+    connect(review, &QPushButton::clicked, this, [this] { tabs_->setCurrentWidget(chat_widget_); });
+    waiting_layout->addWidget(home_waiting_text_, 1);
+    waiting_layout->addWidget(review);
+    home_waiting_->setVisible(false);
+    layout->addWidget(home_waiting_);
+
+    // Four tiles of equal width: an icon, a bold title, and a muted line saying what it's for. The labels let clicks through
+    // to the tile, which is a real button (keyboard focus, Enter, Space).
+    auto* actions = new QHBoxLayout();
+    auto big = [this, actions](const QString& icon, const QString& title, const QString& text, bool primary, QLabel** text_label) {
+        auto* b = new QPushButton(home_page_);
+        b->setProperty("role", primary ? "tile-primary" : "tile");
+        b->setMinimumHeight(118);
+        b->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);  // equal widths, whatever the text
+        b->setAccessibleName(title);
+        b->setToolTip(text);
+        auto* inner = new QVBoxLayout(b);
+        inner->setContentsMargins(16, 14, 16, 14);
+        inner->setSpacing(4);
+        const QPixmap pixmap = app_icon_pixmap(icon, 26, primary ? QColor("#ffffff") : QColor("#ececee"));
+        if (!pixmap.isNull()) {
+            auto* picture = new QLabel(b);
+            picture->setPixmap(pixmap);
+            picture->setAttribute(Qt::WA_TransparentForMouseEvents);
+            inner->addWidget(picture);
+        }
+        inner->addStretch(1);
+        auto* t = plain_label(title, b);
+        t->setProperty("role", "tile-title");
+        t->setAttribute(Qt::WA_TransparentForMouseEvents);
+        inner->addWidget(t);
+        auto* d = plain_label(text, b);
+        d->setProperty("role", "tile-text");
+        d->setAttribute(Qt::WA_TransparentForMouseEvents);
+        inner->addWidget(d);
+        if (text_label) *text_label = d;
+        actions->addWidget(b, 1);
+        return b;
+    };
+    home_chats_button_ = big("chat", "Open chats", "Nothing new", true, &home_chats_text_);
+    auto* add = big("user-plus", "Add contact", "Swap contact cards with someone", false, nullptr);
+    auto* send = big("upload", "Send a file", "Encrypted for one person", false, nullptr);
+    auto* receive = big("download", "Receive a file", "Paste the link you were sent", false, nullptr);
+    connect(home_chats_button_, &QPushButton::clicked, this, [this] { tabs_->setCurrentWidget(chat_widget_); });
+    connect(add, &QPushButton::clicked, this, [this] { add_contact(); });
+    connect(send, &QPushButton::clicked, this, [this] {
+        tabs_->setCurrentWidget(files_page_);
+        recipient_combo_->setFocus();
+    });
+    connect(receive, &QPushButton::clicked, this, [this] {
+        tabs_->setCurrentWidget(files_page_);
+        receive_edit_->setFocus();
+    });
+    layout->addLayout(actions);
+
+    auto* recent_heading = plain_label("Recent chats", home_page_);
+    recent_heading->setProperty("role", "section");
+    layout->addWidget(recent_heading);
+    home_recent_ = new QListWidget(home_page_);
+    home_recent_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    connect(home_recent_, &QListWidget::itemActivated, this, [this](QListWidgetItem* item) {
+        if (!item) return;
+        chat_widget_->open_conversation(item->data(Qt::UserRole).toString());
+        tabs_->setCurrentWidget(chat_widget_);
+    });
+    connect(home_recent_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
+        if (!item) return;
+        chat_widget_->open_conversation(item->data(Qt::UserRole).toString());
+        tabs_->setCurrentWidget(chat_widget_);
+    });
+    layout->addWidget(home_recent_);
+    home_recent_empty_ = plain_label("No chats yet. Use Add contact to swap contact cards with someone, and your chats will appear here.", home_page_);
+    home_recent_empty_->setWordWrap(true);
+    layout->addWidget(home_recent_empty_);
+    layout->addStretch();
+
+    // Home first, then Chats, then Files; the app opens on Home.
+    tabs_->insertTab(0, home_page_, "Home");
+    tabs_->tabBar()->moveTab(tabs_->indexOf(chat_widget_), 1);
+    tabs_->setCurrentWidget(home_page_);
+    refresh_home();
+}
+
+void MainWindow::refresh_home() {
+    if (!home_page_ || !chat_widget_) return;
+    const bool set_up = chat_widget_->is_set_up();
+    const QString status = chat_widget_->messaging_status();
+    const QString waiting = chat_widget_->waiting_summary();
+    const size_t unread = chat_widget_->unread_total();
+    const auto recent = chat_widget_->recent_entries(5);
+    QString signature = status + "|" + waiting + "|" + QString::number(static_cast<qulonglong>(unread)) + (set_up ? "|1" : "|0");
+    for (const auto& r : recent) signature += "|" + r.key + "=" + r.title + "/" + r.subtitle + "/" + QString::number(static_cast<qulonglong>(r.unread)) + "/" + QString::number(static_cast<qlonglong>(r.when));
+    if (signature == home_signature_) return;  // nothing changed: leave it alone
+    home_signature_ = signature;
+    home_status_->setText(set_up ? "Messaging: " + status : QString("Messaging isn't set up yet. Set it up to chat with your contacts (you'll need an invite from a relay)."));
+    home_setup_button_->setVisible(!set_up);
+    home_waiting_text_->setText("Waiting for you: " + waiting);
+    home_waiting_->setVisible(!waiting.isEmpty());
+    home_chats_text_->setText(unread ? QString("%1 unread").arg(static_cast<qulonglong>(unread)) : QString("Nothing new"));
+    fill_chat_list(home_recent_, recent);
+    home_recent_->setFixedHeight(static_cast<int>(recent.size()) * 62 + 12);  // as tall as its chats, no taller
+    home_recent_->setVisible(!recent.empty());
+    home_recent_empty_->setVisible(recent.empty());
+}
+
+void MainWindow::open_settings() {
+    if (!settings_dialog_) return;
+    const bool set_up = chat_widget_ && chat_widget_->is_set_up();
+    if (settings_messaging_status_) settings_messaging_status_->setText(chat_widget_ ? chat_widget_->messaging_status() : QString());
+    if (settings_setup_button_) settings_setup_button_->setVisible(!set_up);
+    for (QPushButton* b : {settings_invites_button_, settings_cards_button_, settings_restore_button_})
+        if (b) b->setEnabled(set_up);
+    update_key_status();
+    settings_dialog_->exec();
+}
+
 void MainWindow::update_key_status() {
     if (keystore_->private_keys_protected()) {
-        key_status_label_->setText("Keys: protected by a passphrase");
-        key_status_label_->setStyleSheet("color: #2e7d32;");
+        key_status_label_->setText("Your keys are protected by a passphrase.");
+        key_status_label_->setStyleSheet(QString("color: ") + app_colors::success + ";");
     } else {
-        key_status_label_->setText("Keys: not protected by a passphrase");
-        key_status_label_->setStyleSheet("color: #b26a00;");
+        key_status_label_->setText("Your keys aren't protected by a passphrase.");
+        key_status_label_->setStyleSheet(QString("color: ") + app_colors::warning + ";");
     }
+    if (key_warning_) key_warning_->setVisible(!keystore_->private_keys_protected());
 }
 
 void MainWindow::set_passphrase_action() {
@@ -500,16 +928,82 @@ void MainWindow::refresh_contacts() {
     if (chat_widget_) chat_widget_->refresh();
 }
 
+// The Add a contact dialog: both halves of swapping cards in one place. Share your card (copy it, or save it as a file), and
+// add theirs (paste it, optionally name them). Adding runs the same checks as always, ending with the fingerprint check; if
+// anything is wrong with what was pasted, the dialog stays open so it can be corrected.
 void MainWindow::add_contact() {
-    QMessageBox choice(QMessageBox::Question, "Add Contact", "How would you like to add the contact?",
-                       QMessageBox::NoButton, this);
-    QAbstractButton* paste_button = choice.addButton("Paste contact card…", QMessageBox::AcceptRole);
-    QAbstractButton* files_button = choice.addButton("Choose key files…", QMessageBox::AcceptRole);
-    choice.addButton(QMessageBox::Cancel);
-    choice.exec();
+    QDialog dialog(this);
+    dialog.setWindowTitle("Add a contact");
+    dialog.setMinimumWidth(560);
+    auto* layout = new QVBoxLayout(&dialog);
 
-    if (choice.clickedButton() == paste_button) add_contact_from_card();
-    else if (choice.clickedButton() == files_button) add_contact_from_files();
+    auto* intro = plain_label("To message each other, you both share your contact card once: send yours to them, and add theirs here.", &dialog);
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto* share = new QGroupBox("1 · Share your card", &dialog);
+    auto* share_layout = new QVBoxLayout(share);
+    auto* share_buttons = new QHBoxLayout();
+    auto* copy_button = new QPushButton("Copy my card", share);
+    copy_button->setProperty("role", "primary");
+    auto* save_button = new QPushButton("Save as file…", share);
+    share_buttons->addWidget(copy_button);
+    share_buttons->addWidget(save_button);
+    share_buttons->addStretch(1);
+    share_layout->addLayout(share_buttons);
+    auto* share_note = plain_label("Send it any way you like: email, another chat app, a USB stick. It holds no secrets.", share);
+    share_note->setWordWrap(true);
+    share_layout->addWidget(share_note);
+    layout->addWidget(share);
+
+    auto* theirs = new QGroupBox("2 · Add their card", &dialog);
+    auto* theirs_layout = new QVBoxLayout(theirs);
+    theirs_layout->addWidget(plain_label("Their card", theirs));
+    auto* card_edit = new QPlainTextEdit(theirs);
+    card_edit->setPlaceholderText("Paste the card they sent you");
+    card_edit->setTabChangesFocus(true);
+    card_edit->setFixedHeight(90);
+    theirs_layout->addWidget(card_edit);
+    theirs_layout->addWidget(plain_label("Name them (optional: their card suggests a name)", theirs));
+    auto* name_edit = new QLineEdit(theirs);
+    name_edit->setPlaceholderText("How they'll appear in your contacts");
+    theirs_layout->addWidget(name_edit);
+    layout->addWidget(theirs);
+
+    auto* check_note = plain_label("Before they're added you'll see their fingerprint: check it with them in person or on a call, so you "
+                                   "know nobody swapped the card on the way.", &dialog);
+    check_note->setWordWrap(true);
+    layout->addWidget(check_note);
+
+    auto* footer = new QHBoxLayout();
+    auto* files_button = new QPushButton("Use key files instead…", &dialog);
+    files_button->setToolTip("For contacts who sent you their two public key files rather than a card");
+    files_button->setProperty("role", "link");
+    auto* cancel_button = new QPushButton("Cancel", &dialog);
+    auto* add_button = new QPushButton("Add contact", &dialog);
+    add_button->setProperty("role", "primary");
+    add_button->setDefault(true);
+    add_button->setEnabled(false);
+    footer->addWidget(files_button);
+    footer->addStretch(1);
+    footer->addWidget(cancel_button);
+    footer->addWidget(add_button);
+    layout->addLayout(footer);
+
+    bool use_files = false;
+    connect(copy_button, &QPushButton::clicked, &dialog, [this] { copy_contact_card(); });
+    connect(save_button, &QPushButton::clicked, &dialog, [this] { save_contact_card(); });
+    connect(card_edit, &QPlainTextEdit::textChanged, &dialog, [card_edit, add_button] { add_button->setEnabled(!card_edit->toPlainText().trimmed().isEmpty()); });
+    connect(cancel_button, &QPushButton::clicked, &dialog, &QDialog::reject);
+    connect(files_button, &QPushButton::clicked, &dialog, [&dialog, &use_files] {
+        use_files = true;
+        dialog.reject();
+    });
+    connect(add_button, &QPushButton::clicked, &dialog, [this, &dialog, card_edit, name_edit] {
+        if (add_contact_from_card_text(card_edit->toPlainText(), name_edit->text().trimmed())) dialog.accept();
+    });
+    dialog.exec();
+    if (use_files) add_contact_from_files();
 }
 
 // Asks for a contact name, validates it, and confirms before replacing an existing contact.
@@ -519,13 +1013,17 @@ std::optional<QString> MainWindow::ask_contact_name(const QString& suggested) {
                                          "Contact name (letters, digits, spaces, - _ .):",
                                          QLineEdit::Normal, suggested, &ok).trimmed();
     if (!ok || name.isEmpty()) return std::nullopt;
+    if (!confirm_contact_name(name)) return std::nullopt;
+    return name;
+}
 
+bool MainWindow::confirm_contact_name(const QString& name) {
     std::string name_str = name.toStdString();
     if (!KeyStore::is_valid_contact_name(name_str)) {
         QMessageBox::warning(this, "Add Contact",
                              "Please use 1-64 letters, digits, spaces, '-', '_' or '.'. "
                              "The name can't start or end with a dot or space, or be \"self\".");
-        return std::nullopt;
+        return false;
     }
     if (keystore_->contact_exists(name_str) &&
         QMessageBox::question(this, "Add Contact",
@@ -534,23 +1032,19 @@ std::optional<QString> MainWindow::ask_contact_name(const QString& suggested) {
                               " has a new identity, or this is someone else's card. You must check the new "
                               "fingerprint with them again before trusting it.\n\nReplace the saved keys?") !=
             QMessageBox::Yes) {
-        return std::nullopt;
+        return false;
     }
-    return name;
+    return true;
 }
 
-void MainWindow::add_contact_from_card() {
+bool MainWindow::add_contact_from_card_text(const QString& text, const QString& chosen_name) {
     // The box starts empty: the user pastes the card themselves (nothing is read from the clipboard unasked).
-    bool ok = false;
-    QString text = QInputDialog::getMultiLineText(this, "Add Contact",
-                                                  "Paste the contact card you received:", QString(), &ok);
-    if (!ok || text.trimmed().isEmpty()) return;
-
+    if (text.trimmed().isEmpty()) return false;
     std::string error;
-    auto card = decode_any_contact_card(text.toStdString(), &error);
+    auto card = decode_any_contact_card(text.trimmed().toStdString(), &error);
     if (!card) {
         QMessageBox::warning(this, "Add Contact", qstr(error));
-        return;
+        return false;
     }
 
     if (card->bundle) {
@@ -582,8 +1076,9 @@ void MainWindow::add_contact_from_card() {
                 QMessageBox::warning(this, "Add Contact",
                                      "This card for " + who + " is older than the one you have, and uses a "
                                      "different encryption key. It was ignored.");
+                return false;
             }
-            return;
+            return true;
         }
     } else {
         QMessageBox old_card(QMessageBox::Warning, "Older contact card",
@@ -595,13 +1090,18 @@ void MainWindow::add_contact_from_card() {
                              QMessageBox::Yes | QMessageBox::No, this);
         old_card.setTextFormat(Qt::PlainText);
         old_card.setDefaultButton(QMessageBox::No);
-        if (old_card.exec() != QMessageBox::Yes) return;
+        if (old_card.exec() != QMessageBox::Yes) return false;
     }
 
-    auto name = ask_contact_name(qstr(sanitize_contact_name(card->name)));
-    if (!name) return;
-    finish_add_contact(*name, card->pub_kem, card->pub_dsa, card->server, card->bundle ? &*card->bundle : nullptr,
-                       card->send_token);
+    std::optional<QString> name;
+    if (!chosen_name.isEmpty()) {
+        if (confirm_contact_name(chosen_name)) name = chosen_name;
+    } else {
+        name = ask_contact_name(qstr(sanitize_contact_name(card->name)));
+    }
+    if (!name) return false;
+    return finish_add_contact(*name, card->pub_kem, card->pub_dsa, card->server, card->bundle ? &*card->bundle : nullptr,
+                              card->send_token);
 }
 
 void MainWindow::add_contact_from_files() {
@@ -630,7 +1130,7 @@ void MainWindow::add_contact_from_files() {
 }
 
 // Shared by both ways of adding a contact: sanity checks, fingerprint confirmation, save.
-void MainWindow::finish_add_contact(const QString& name,
+bool MainWindow::finish_add_contact(const QString& name,
                                     const std::vector<uint8_t>& pub_kem,
                                     const std::vector<uint8_t>& pub_dsa,
                                     const std::string& card_server,
@@ -640,12 +1140,12 @@ void MainWindow::finish_add_contact(const QString& name,
     std::string fp = CryptoEngine::fingerprint(pub_dsa);
     if (fp == keystore_->own_fingerprint()) {
         QMessageBox::warning(this, "Add Contact", "These are your own public keys.");
-        return;
+        return false;
     }
     if (auto existing = keystore_->find_contact_by_fingerprint(fp); existing && existing->name != name_str) {
         QMessageBox::warning(this, "Add Contact",
                              "These keys are already saved as \"" + qstr(existing->name) + "\".");
-        return;
+        return false;
     }
 
     const QString risk = bundle
@@ -662,7 +1162,7 @@ void MainWindow::finish_add_contact(const QString& name,
                         "\n\n" + risk + "\n\nDoes the fingerprint match?",
                         QMessageBox::Yes | QMessageBox::No, this);
     confirm.setTextFormat(Qt::PlainText);
-    if (confirm.exec() != QMessageBox::Yes) return;
+    if (confirm.exec() != QMessageBox::Yes) return false;
 
     try {
         if (bundle) {
@@ -673,7 +1173,7 @@ void MainWindow::finish_add_contact(const QString& name,
         }
     } catch (const std::exception& e) {
         QMessageBox::warning(this, "Add Contact", qstr(e.what()));
-        return;
+        return false;
     }
 
     // The user confirmed the fingerprint above, so they count as verified in the chats too.
@@ -700,6 +1200,7 @@ void MainWindow::finish_add_contact(const QString& name,
             }
         }
     }
+    return true;
 }
 
 void MainWindow::remove_contact() {
@@ -717,47 +1218,70 @@ void MainWindow::remove_contact() {
     update_status("Contact removed: " + name.toStdString());
 }
 
-void MainWindow::copy_contact_card() {
-    // With messaging set up, every card carries a fresh permission to message you, made for one person.
-    if (chat_widget_ && chat_widget_->is_set_up()) {
-        chat_widget_->copy_card_to_clipboard();
-        return;
-    }
+// Our contact card: a messaging card (with its own permission to message us) when messaging is set up, else a plain signed card.
+std::optional<QString> MainWindow::own_card_text() {
+    if (chat_widget_ && chat_widget_->is_set_up()) return chat_widget_->make_card_text();
     QSettings settings;
     bool ok = false;
     QString name = QInputDialog::getText(this, "Contact Card", "Your name, as your contacts will see it:",
                                          QLineEdit::Normal,
                                          settings.value("display_name", default_display_name()).toString(), &ok).trimmed();
-    if (!ok || name.isEmpty()) return;
+    if (!ok || name.isEmpty()) return std::nullopt;
     if (name.toUtf8().size() > 64) {
         QMessageBox::warning(this, "Contact Card", "Please use a shorter name (64 bytes at most).");
-        return;
+        return std::nullopt;
     }
     settings.setValue("display_name", name);
 
     std::string relay_hint;
     if (auto server = configured_server(server_edit_)) relay_hint = format_server_address(*server);
-
-    std::vector<uint8_t> bundle;
     try {
-        bundle = keystore_->make_own_bundle(name.toStdString(), relay_hint);
+        return qstr(encode_contact_card_v2(keystore_->make_own_bundle(name.toStdString(), relay_hint)));
     } catch (const std::exception& e) {
         QMessageBox::warning(this, "Contact Card", qstr(e.what()));
-        return;
+        return std::nullopt;
     }
-    QGuiApplication::clipboard()->setText(qstr(encode_contact_card_v2(bundle)));
+}
 
+// What to tell the user once their card is on its way: what it holds, and the fingerprint their contact should check.
+void MainWindow::show_card_note(const QString& where) {
+    const bool messaging = chat_widget_ && chat_widget_->is_set_up();
     QMessageBox info(QMessageBox::Information, "Contact Card",
-                     "Your contact card is on the clipboard. Paste it into a message to your contact.\n\n"
-                     "It contains only public information, and it is signed with your identity key, so it "
-                     "can't be altered on the way without being noticed. A signature can't say who made a "
-                     "card, though, so ask your contact to check this fingerprint with you in person or on a "
-                     "call when they add you:\n\n" +
-                     formatted_fingerprint(keystore_->own_fingerprint()),
+                     "Your contact card is " + where + "\n\n"
+                     "It contains only public information, and it is signed with your identity key, so it can't be altered on "
+                     "the way without being noticed." +
+                         QString(messaging ? " It also carries a permission to message you that belongs to this card alone." : "") +
+                         " A signature can't say who made a card, though, so ask your contact to check this fingerprint with "
+                         "you in person or on a call when they add you:\n\n" +
+                         formatted_fingerprint(keystore_->own_fingerprint()),
                      QMessageBox::Ok, this);
     info.setTextFormat(Qt::PlainText);
     info.exec();
+}
+
+void MainWindow::copy_contact_card() {
+    auto card = own_card_text();
+    if (!card) return;
+    QGuiApplication::clipboard()->setText(*card);
+    show_card_note("on the clipboard. Paste it into a message to your contact.");
     update_status("Contact card copied to clipboard");
+}
+
+void MainWindow::save_contact_card() {
+    // Where first: cancelling then makes no card (a messaging card would otherwise use up a permission for nothing).
+    const QString path = QFileDialog::getSaveFileName(this, "Save your contact card", QDir(QDir::homePath()).filePath("my-contact-card.txt"),
+                                                      "Text files (*.txt);;All files (*)");
+    if (path.isEmpty()) return;
+    auto card = own_card_text();
+    if (!card) return;
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text) || file.write(card->toUtf8()) < 0) {
+        QMessageBox::warning(this, "Contact Card", "Could not save the card: " + file.errorString());
+        return;
+    }
+    file.close();
+    show_card_note("saved in " + path + ". Send that file to your contact.");
+    update_status("Contact card saved");
 }
 
 void MainWindow::export_keys() {
@@ -783,6 +1307,13 @@ void MainWindow::export_keys() {
 
 void MainWindow::save_server_setting() {
     QSettings().setValue(SERVER_SETTING, server_edit_->text().trimmed());
+    update_relay_label();
+}
+
+void MainWindow::update_relay_label() {
+    if (!relay_label_) return;
+    const QString server = server_edit_->text().trimmed();
+    relay_label_->setText(server.isEmpty() ? QString("No relay set for files") : "Using relay " + server);
 }
 
 void MainWindow::start_send() {
@@ -847,10 +1378,13 @@ void MainWindow::start_receive() {
     std::string host = server->host;
     uint16_t port = server->port;
 
-    bool ok = false;
-    QString input = QInputDialog::getText(this, "Receive File", "Paste the share link or transfer ID:",
-                                          QLineEdit::Normal, "", &ok).trimmed();
-    if (!ok || input.isEmpty()) return;
+    // The Receive card's box (UX step 4), rather than a separate prompt.
+    QString input = receive_edit_->text().trimmed();
+    if (input.isEmpty()) {
+        QMessageBox::information(this, "Receive a file", "Paste the link or transfer ID you were sent into the box first.");
+        receive_edit_->setFocus();
+        return;
+    }
 
     std::string id = input.toStdString();
     if (input.startsWith("pqft://", Qt::CaseInsensitive)) {
@@ -945,6 +1479,10 @@ void MainWindow::set_busy(bool busy) {
     server_edit_->setEnabled(!busy);
     recipient_combo_->setEnabled(!busy);
     cancel_button_->setEnabled(busy);
+    if (receive_edit_) receive_edit_->setEnabled(!busy);
+    if (change_relay_button_) change_relay_button_->setEnabled(!busy);
+    if (progress_row_) progress_row_->setVisible(busy);
+    if (busy && result_box_) result_box_->setVisible(false);  // a new transfer: the last link no longer applies
 }
 
 void MainWindow::copy_share_link() {
@@ -978,22 +1516,23 @@ void MainWindow::update_progress(double fraction) {
 
 void MainWindow::show_error(const std::string& error) {
     status_label_->setText("Error: " + qstr(error));
-    status_label_->setStyleSheet("color: #c62828;");
+    status_label_->setStyleSheet(QString("color: ") + app_colors::error + ";");
     if (progress_bar_) progress_bar_->setValue(0);
 }
 
 void MainWindow::show_complete(const std::string& filepath) {
     // The engine's last status message already says what happened.
     status_label_->setToolTip(qstr(filepath));
-    status_label_->setStyleSheet("color: #2e7d32;");
+    status_label_->setStyleSheet(QString("color: ") + app_colors::success + ";");
     if (progress_bar_) progress_bar_->setValue(100);
 }
 
 void MainWindow::show_transfer_id(const std::string& id) {
     current_transfer_id_ = qstr(id);
     current_share_link_ = qstr(build_share_link(last_server_, id));
-    transfer_id_label_->setText("Share link: " + current_share_link_ +
-                                "\nSend this to the recipient. It works once and expires in 24 hours.");
+    transfer_id_label_->setText("Give the recipient this link. It works once, and expires in 24 hours. Only their app can open the file.\n\n" +
+                                current_share_link_);
     copy_link_button_->setEnabled(true);
     copy_id_button_->setEnabled(true);
+    if (result_box_) result_box_->setVisible(true);
 }

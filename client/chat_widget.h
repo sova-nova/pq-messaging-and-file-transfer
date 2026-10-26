@@ -5,11 +5,13 @@
 #include <atomic>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <memory>
 #include <string>
 #include <thread>
 
 #include "messaging_engine.h"
+#include "chat_entry.h"
 #include "message_view.h"
 
 class QCheckBox;
@@ -38,6 +40,23 @@ public:
 
     // Makes a contact card with a fresh send token for one person and puts it on the clipboard.
     void copy_card_to_clipboard();
+    // A new messaging card (asks who it is for; each card carries its own permission to message us), or nothing if cancelled.
+    std::optional<QString> make_card_text();
+    // The Add contact button: the main window owns adding contacts.
+    void set_on_add_contact(std::function<void()> f) { on_add_contact_ = std::move(f); }
+    // For the main window's Settings.
+    void open_setup();
+    void setup_with_invite(const QString& invite);  // the same checks and confirmation as Set up messaging…
+    void open_relay_invites();
+    void open_cards_issued();
+    void open_restore();
+    QString messaging_status() const;
+    // For Home (UX step 5).
+    void set_on_changed(std::function<void()> f) { on_changed_ = std::move(f); }  // after each look for news
+    QString waiting_summary() const;  // "1 message request · 2 group invitations", or empty
+    size_t unread_total() const { return last_unread_; }
+    std::vector<ChatEntry> recent_entries(int count) const;  // most recent first, as the Chats list shows them
+    void open_conversation(const QString& key);  // a key from recent_entries
 
     // Call after contacts were added or changed from outside this tab.
     void refresh();
@@ -46,13 +65,15 @@ public:
     void mark_verified(const std::string& fingerprint);
 
 private:
-    void setup_messaging();
+    void setup_messaging(const QString& preset_invite = QString());  // empty: ask for it
     void review_requests();
     void create_group_dialog();
     void make_relay_invite();
     void restore_history();
     void attach_file();
     void render_privates();
+    void render_conversations();
+    void sync_conversation_selection();
     void render_private_messages(bool force_scroll);
     void select_private(const QString& chat_id);
     void start_private_chat();
@@ -95,12 +116,28 @@ private:
     QPushButton* restore_button_ = nullptr;
     QPushButton* attach_button_ = nullptr;   // choose a file to send in the chat on screen
     std::function<void(const QString&)> on_relay_chosen_;
+    std::function<void()> on_add_contact_;
+    std::function<void()> on_changed_;
     std::function<void(size_t)> on_unread_changed_;
     size_t last_unread_ = static_cast<size_t>(-1);
     bool animating_ = false;                 // an upload or download is under way: redraw now and then to show its progress
     QPushButton* deletions_button_ = nullptr;     // requests from others to delete a chat or messages
     QPushButton* delete_chat_button_ = nullptr;   // ask everyone to delete the chat on screen
     QPushButton* invites_button_ = nullptr;
+    QPushButton* add_contact_button_ = nullptr;
+    // UX step 2: the visible controls. The original buttons and boxes still exist, inside `hidden_` (a hidden holder, so nothing
+    // can show them again), and these trigger them, so every confirmation and check behind them runs exactly as before.
+    QWidget* hidden_ = nullptr;
+    QPushButton* new_button_ = nullptr;       // New ▾: group, Private chat
+    QPushButton* waiting_button_ = nullptr;   // shown only when requests, invitations or deletion requests are waiting
+    QPushButton* options_button_ = nullptr;   // ⋯ in the chat header
+    QListWidget* conversations_ = nullptr;    // one list: contacts, groups and Private chats, most recent first
+    std::vector<ChatEntry> conversation_entries_;  // what it shows
+    QLabel* header_icon_ = nullptr;           // an hourglass beside a Private chat's name (when icons are available)
+    QLabel* header_note_ = nullptr;           // the header's smaller second part: trust, members, a Private chat's limits
+    void set_header(const QString& text);     // first line: the title; the rest: the note
+    size_t waiting_requests_ = 0, waiting_invitations_ = 0, waiting_deletions_ = 0;
+    QString last_card_label_;  // who the last card made was for (for the note shown after copying it)
     QListWidget* contacts_ = nullptr;
     QLabel* groups_label_ = nullptr;
     QListWidget* groups_ = nullptr;

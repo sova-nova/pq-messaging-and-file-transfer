@@ -37,7 +37,7 @@ QCheckBox* remember_checkbox(QWidget* parent) {
 
 QLabel* error_label(QWidget* parent) {
     auto* label = text_label(QString(), parent);
-    label->setStyleSheet("color: #c62828;");
+    label->setStyleSheet("color: #ff8a80;");  // readable on the app's dark background (app_colors::error)
     return label;
 }
 

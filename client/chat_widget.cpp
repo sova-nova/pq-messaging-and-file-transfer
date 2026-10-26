@@ -1,4 +1,5 @@
 #include "chat_widget.h"
+#include "icons.h"
 
 #include "crypto_engine.h"
 #include "protocol.h"
@@ -54,6 +55,13 @@ QString status_word(int status, bool outgoing) {
 }
 
 void plain_box(QMessageBox& box) { box.setTextFormat(Qt::PlainText); }
+
+// "  (read)" → " · read": a status word for a message box's top line.
+QString meta_status(const QString& word) {
+    QString t = word.trimmed();
+    if (t.startsWith("(") && t.endsWith(")")) t = t.mid(1, t.size() - 2);
+    return t.isEmpty() ? QString() : " · " + t;
+}
 
 // How long a Private message has left, in words.
 static QString time_left(int64_t seconds) {
@@ -181,34 +189,81 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     deletions_button_->setToolTip("Other people asking to delete a chat, or messages in it, for everyone. It only happens if everyone agrees.");
     relay_invite_button_ = new QPushButton("Relay invites…", this);
     relay_invite_button_->setToolTip("Make a one-time invite so a friend can use this relay (you are vouching for them), and manage the ones you made.");
-    top->addWidget(status_label_, 1);
-    top->addWidget(setup_button_);
-    top->addWidget(requests_button_);
-    top->addWidget(invites_button_);
-    top->addWidget(deletions_button_);
-    top->addWidget(new_group_button_);
-    top->addWidget(new_private_button_);
-    top->addWidget(relay_invite_button_);
     restore_button_ = new QPushButton("Restore history…", this);
     restore_button_->setToolTip("After reinstalling: get your saved chats back from the relay");
-    top->addWidget(restore_button_);
-    top->addWidget(cards_button_);
+    // The original buttons live in a hidden holder; the menus and the "waiting" row below trigger them.
+    hidden_ = new QWidget(this);
+    hidden_->hide();
+    for (QWidget* w : std::initializer_list<QWidget*>{requests_button_, invites_button_, deletions_button_, new_group_button_, new_private_button_,
+                                                      relay_invite_button_, restore_button_, cards_button_})
+        w->setParent(hidden_);
+    top->addWidget(status_label_, 1);
+    top->addWidget(setup_button_);
     root->addLayout(top);
 
     // --- Contacts and conversation ---
     auto* body = new QHBoxLayout();
     auto* left = new QVBoxLayout();
-    contacts_ = new QListWidget(this);
-    contacts_->setMinimumWidth(170);
-    contacts_->setMaximumWidth(230);
-    left->addWidget(contacts_, 3);
-    groups_label_ = new QLabel("Groups", this);
+    add_contact_button_ = new QPushButton("Add contact…", this);
+    add_contact_button_->setToolTip("Swap contact cards with someone so you can message each other");
+    add_contact_button_->setDefault(false);
+    add_contact_button_->setProperty("role", "primary");
+    add_contact_button_->setIcon(app_icon("user-plus", QColor("#ffffff")));
+    new_button_ = new QPushButton("New", this);
+    new_button_->setToolTip("Start a group, or a Private chat whose messages disappear");
+    new_button_->setIcon(app_icon("plus"));
+    auto* new_menu = new QMenu(new_button_);
+    new_button_->setMenu(new_menu);
+    connect(new_menu, &QMenu::aboutToShow, this, [this, new_menu] {
+        new_menu->clear();
+        QAction* group = new_menu->addAction("New group…");
+        group->setEnabled(new_group_button_->isEnabled());
+        connect(group, &QAction::triggered, this, [this] { new_group_button_->click(); });
+        QAction* priv = new_menu->addAction("New Private chat…");
+        priv->setEnabled(new_private_button_->isEnabled());
+        priv->setToolTip(new_private_button_->toolTip());
+        connect(priv, &QAction::triggered, this, [this] { new_private_button_->click(); });
+    });
+    auto* left_buttons = new QHBoxLayout();
+    left_buttons->addWidget(add_contact_button_, 1);
+    left_buttons->addWidget(new_button_);
+    left->addLayout(left_buttons);
+    connect(add_contact_button_, &QPushButton::clicked, this, [this] { if (on_add_contact_) on_add_contact_(); });
+    // What is waiting for an answer: one row, shown only when there is something.
+    waiting_button_ = new QPushButton(this);
+    waiting_button_->setProperty("role", "info");
+    waiting_button_->setVisible(false);
+    auto* waiting_menu = new QMenu(waiting_button_);
+    waiting_button_->setMenu(waiting_menu);
+    connect(waiting_menu, &QMenu::aboutToShow, this, [this, waiting_menu] {
+        waiting_menu->clear();
+        auto add = [this, waiting_menu](size_t count, QPushButton* source, const QString& one, const QString& many) {
+            if (!count) return;
+            QAction* a = waiting_menu->addAction(count == 1 ? one : QString(many).arg(static_cast<qulonglong>(count)));
+            connect(a, &QAction::triggered, this, [source] { source->click(); });
+        };
+        add(waiting_requests_, requests_button_, "1 message request…", "%1 message requests…");
+        add(waiting_invitations_, invites_button_, "1 group invitation…", "%1 group invitations…");
+        add(waiting_deletions_, deletions_button_, "1 deletion request…", "%1 deletion requests…");
+    });
+    left->addWidget(waiting_button_);
+    conversations_ = new QListWidget(this);
+    conversations_->setMinimumWidth(200);
+    conversations_->setMaximumWidth(280);
+    left->addWidget(conversations_, 1);
+    connect(conversations_, &QListWidget::currentItemChanged, this, [this](QListWidgetItem* item, QListWidgetItem*) {
+        if (updating_ui_ || !item) return;
+        const QString key = item->data(Qt::UserRole).toString();
+        const QString id = key.mid(2);
+        if (key.startsWith("c:")) select_contact(id);
+        else if (key.startsWith("g:")) select_group(id);
+        else if (key.startsWith("p:")) select_private(id);
+    });
+    // The three lists the combined one is built from: they keep their own rendering, hidden.
+    contacts_ = new QListWidget(hidden_);
+    groups_label_ = new QLabel("Groups", hidden_);
     groups_label_->setTextFormat(Qt::PlainText);
-    groups_ = new QListWidget(this);
-    groups_->setMinimumWidth(170);
-    groups_->setMaximumWidth(230);
-    left->addWidget(groups_label_);
-    left->addWidget(groups_, 2);
+    groups_ = new QListWidget(hidden_);
     groups_label_->setVisible(false);  // shown once there is a group
     groups_->setVisible(false);
     // Private chats: listed apart from the saved ones, marked with an hourglass, so the two are never confused.
@@ -219,17 +274,18 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     privates_->setMinimumWidth(170);
     privates_->setMaximumWidth(230);
     privates_->setToolTip(private_label_->toolTip());
-    left->addWidget(private_label_);
-    left->addWidget(privates_, 2);
+    private_label_->setParent(hidden_);
+    privates_->setParent(hidden_);
     private_label_->setVisible(false);  // shown once there is a Private chat
     privates_->setVisible(false);
     body->addLayout(left);
 
     auto* right = new QVBoxLayout();
     auto* header_row = new QHBoxLayout();
-    header_label_ = new QLabel("Choose a contact or group", this);
+    header_label_ = new QLabel("Choose a chat", this);
     header_label_->setTextFormat(Qt::PlainText);
     header_label_->setWordWrap(true);
+    header_label_->setProperty("role", "title");
     delivery_box_ = new QCheckBox("Delivery receipts", this);
     read_box_ = new QCheckBox("Read receipts", this);
     delivery_box_->setToolTip("Tell them when a message reaches this device");
@@ -240,12 +296,56 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     delete_chat_button_->setToolTip("Ask everyone in this chat to delete it, from the relay and from every device. It only happens if everyone agrees.");
     people_button_ = new QPushButton("Verify…", this);
     people_button_->setToolTip("See a fingerprint to compare with the person, and mark them as verified");
-    header_row->addWidget(header_label_, 1);
-    header_row->addWidget(delivery_box_);
-    header_row->addWidget(read_box_);
-    header_row->addWidget(people_button_);
-    header_row->addWidget(delete_chat_button_);
-    header_row->addWidget(revoke_button_);
+    for (QWidget* w : std::initializer_list<QWidget*>{delivery_box_, read_box_, people_button_, delete_chat_button_, revoke_button_}) w->setParent(hidden_);
+    options_button_ = new QPushButton("⋯", this);
+    options_button_->setToolTip("Chat options: receipts, fingerprint, blocking, deleting");
+    options_button_->setAccessibleName("Chat options");
+    auto* options_menu = new QMenu(options_button_);
+    options_button_->setMenu(options_menu);
+    connect(options_menu, &QMenu::aboutToShow, this, [this, options_menu] {
+        options_menu->clear();
+        auto usable = [](QWidget* w) { return w->isEnabled() && !w->isHidden(); };
+        auto add = [this, options_menu](const QString& text, QAbstractButton* source) {
+            QAction* a = options_menu->addAction(text);
+            a->setToolTip(source->toolTip());
+            connect(a, &QAction::triggered, this, [source] { source->click(); });
+            return a;
+        };
+        bool receipts = false;
+        for (QCheckBox* box : {delivery_box_, read_box_}) {
+            if (!usable(box)) continue;
+            QAction* a = add(box == delivery_box_ ? "Send delivery receipts" : "Send read receipts", box);
+            a->setCheckable(true);
+            a->setChecked(box->isChecked());
+            receipts = true;
+        }
+        if (receipts) options_menu->addSeparator();
+        if (usable(people_button_)) add(people_button_->text() == "Verify…" ? QString("Check fingerprint…") : people_button_->text(), people_button_);
+        if (!current_fp_.isEmpty() && new_private_button_->isEnabled()) add("Start a Private chat…", new_private_button_);
+        if (usable(revoke_button_)) add("Block from messaging…", revoke_button_);
+        if (usable(delete_chat_button_)) {
+            options_menu->addSeparator();
+            add("Delete chat…", delete_chat_button_);
+        }
+        if (options_menu->isEmpty()) options_menu->addAction("Nothing to change here")->setEnabled(false);
+    });
+    header_icon_ = new QLabel(this);
+    header_icon_->setVisible(false);
+    header_note_ = new QLabel(this);
+    header_note_->setTextFormat(Qt::PlainText);
+    header_note_->setWordWrap(true);
+    header_note_->setProperty("role", "note");
+    header_note_->setVisible(false);
+    auto* header_text = new QVBoxLayout();
+    header_text->setSpacing(2);
+    auto* header_title_row = new QHBoxLayout();
+    header_title_row->setSpacing(8);
+    header_title_row->addWidget(header_icon_);
+    header_title_row->addWidget(header_label_, 1);
+    header_text->addLayout(header_title_row);
+    header_text->addWidget(header_note_);
+    header_row->addLayout(header_text, 1);
+    header_row->addWidget(options_button_);
     right->addLayout(header_row);
 
     messages_ = new MessageView(this);
@@ -255,7 +355,10 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     input_ = new QLineEdit(this);
     input_->setPlaceholderText("Write a message…");
     send_button_ = new QPushButton("Send", this);
+    send_button_->setProperty("role", "primary");
+    send_button_->setIcon(app_icon("send", QColor("#ffffff")));
     attach_button_ = new QPushButton("Attach…", this);
+    attach_button_->setIcon(app_icon("paperclip"));
     attach_button_->setToolTip("Send a file. What you have typed is sent with it as a caption.");
     input_row->addWidget(input_, 1);
     input_row->addWidget(attach_button_);
@@ -434,6 +537,17 @@ void ChatWidget::refresh_if_changed() {
     for (const auto& d : engine_->deletions())
         if (d.state == HistoryStore::DeletionPending && !d.mine) deletion_asks++;
     deletions_button_->setText(deletion_asks ? QString("Deletion requests (%1)").arg(static_cast<qulonglong>(deletion_asks)) : QString("Deletion requests"));
+    waiting_requests_ = pending;
+    waiting_invitations_ = invitations;
+    waiting_deletions_ = engine_->is_set_up() ? deletion_asks : 0;
+    {
+        QStringList parts;
+        if (waiting_requests_) parts << (waiting_requests_ == 1 ? QString("1 message request") : QString("%1 message requests").arg(static_cast<qulonglong>(waiting_requests_)));
+        if (waiting_invitations_) parts << (waiting_invitations_ == 1 ? QString("1 group invitation") : QString("%1 group invitations").arg(static_cast<qulonglong>(waiting_invitations_)));
+        if (waiting_deletions_) parts << (waiting_deletions_ == 1 ? QString("1 deletion request") : QString("%1 deletion requests").arg(static_cast<qulonglong>(waiting_deletions_)));
+        waiting_button_->setText(parts.join(" · ") + "  –  Review");
+        waiting_button_->setVisible(!parts.isEmpty());
+    }
     deletions_button_->setEnabled(engine_->is_set_up());
 
     for (const auto& line : engine_->take_notices()) {
@@ -459,6 +573,7 @@ void ChatWidget::refresh_if_changed() {
         render_messages(false);
         update_header();  // a group's "setting up" note changes as members' keys arrive
     }
+    if (on_changed_) on_changed_();
 }
 
 void ChatWidget::render_chats() {
@@ -481,6 +596,7 @@ void ChatWidget::render_chats() {
     }
     if (select_row >= 0) contacts_->setCurrentRow(select_row);
     updating_ui_ = false;
+    render_conversations();
 }
 
 void ChatWidget::render_groups() {
@@ -503,6 +619,7 @@ void ChatWidget::render_groups() {
     groups_->setVisible(row > 0);
     if (select_row >= 0) groups_->setCurrentRow(select_row);
     updating_ui_ = false;
+    render_conversations();
 }
 
 void ChatWidget::render_messages(bool force_scroll) {
@@ -515,7 +632,12 @@ void ChatWidget::render_messages(bool force_scroll) {
         return;
     }
     if (current_fp_.isEmpty()) {
-        messages_->set_lines(QString(), {}, true);
+        // Nothing chosen: say what to do next.
+        MessageLine hint;
+        if (!engine_->is_set_up()) hint.text = "Messaging isn't set up yet. Click \"Set up messaging…\" at the top, and paste the invite you were given.";
+        else if (conversations_->count() == 0) hint.text = "No chats yet. Click \"Add contact…\" to swap contact cards with someone, and your chat with them will appear here.";
+        else hint.text = "Choose a chat on the left.";
+        messages_->set_lines("empty", {hint}, true);
         shown_messages_ = 0;
         return;
     }
@@ -529,12 +651,16 @@ void ChatWidget::render_messages(bool force_scroll) {
         l.outgoing = m.outgoing;
         if (m.deleted) {  // removed by agreement of everyone in the chat: only its place is left
             l.text = "[" + when + "] (deleted by agreement)";
+            l.meta = who + " · " + when;
+            l.body = "(deleted by agreement)";
             lines.push_back(std::move(l));
             continue;
         }
         QString body = m.is_attachment ? attachment_line(*engine_, m.attachment, m.text, animating_) : qstr(m.text);
         l.text = "[" + when + "] " + who + ": " + body + (m.is_attachment ? QString() : status_word(m.status, m.outgoing));
         if (m.gap) l.text += "\n    (a message before this one is missing)";
+        l.meta = who + " · " + when + (m.is_attachment ? QString() : meta_status(status_word(m.status, m.outgoing)));
+        l.body = body + (m.gap ? QString("\n(a message before this one is missing)") : QString());
         l.copy_text = m.is_attachment ? "[" + when + "] " + who + ": " + qstr(m.attachment.name) + " (" + human_size(m.attachment.size) + ")" + (m.text.empty() ? QString() : "\n" + qstr(m.text))
                                       : "[" + when + "] " + who + ": " + qstr(m.text);
         if (m.is_attachment) {
@@ -542,6 +668,11 @@ void ChatWidget::render_messages(bool force_scroll) {
             l.tooltip = "Double-click for what you can do with this file";
         }
         lines.push_back(std::move(l));
+    }
+    if (lines.empty()) {
+        MessageLine hint;
+        hint.text = "No messages yet. Say hello!";
+        lines.push_back(std::move(hint));
     }
     messages_->set_lines("c:" + current_fp_, std::move(lines), force_scroll || messages.size() != shown_messages_);
     shown_messages_ = messages.size();
@@ -565,6 +696,8 @@ void ChatWidget::render_group_messages(bool force_scroll) {
         l.outgoing = m.outgoing;
         if (m.deleted) {  // removed by agreement of everyone in the chat: only its place is left
             l.text = "[" + when + "] (deleted by agreement)";
+            l.meta = who + " · " + when;
+            l.body = "(deleted by agreement)";
             lines.push_back(std::move(l));
             continue;
         }
@@ -573,6 +706,8 @@ void ChatWidget::render_group_messages(bool force_scroll) {
         QString body = m.is_attachment ? attachment_line(*engine_, m.attachment, m.text, animating_) : qstr(m.text);
         l.text = "[" + when + "] " + who + ": " + body + (m.is_attachment ? QString() : status);
         if (m.gap) l.text += "\n    (a message before this one is missing)";
+        l.meta = who + " · " + when + (m.is_attachment ? QString() : meta_status(status));
+        l.body = body + (m.gap ? QString("\n(a message before this one is missing)") : QString());
         l.copy_text = m.is_attachment ? "[" + when + "] " + who + ": " + qstr(m.attachment.name) + " (" + human_size(m.attachment.size) + ")" + (m.text.empty() ? QString() : "\n" + qstr(m.text))
                                       : "[" + when + "] " + who + ": " + qstr(m.text);
         if (m.is_attachment) {
@@ -584,11 +719,18 @@ void ChatWidget::render_group_messages(bool force_scroll) {
         }
         lines.push_back(std::move(l));
     }
+    if (lines.empty()) {
+        MessageLine hint;
+        hint.text = "No messages in this group yet.";
+        lines.push_back(std::move(hint));
+    }
     messages_->set_lines("g:" + current_group_, std::move(lines), force_scroll || messages.size() != shown_messages_);
     shown_messages_ = messages.size();
 }
 
 void ChatWidget::update_header() {
+    sync_conversation_selection();
+    options_button_->setEnabled(!current_fp_.isEmpty() || !current_group_.isEmpty() || !current_private_.isEmpty());
     if (!current_private_.isEmpty()) {
         // A Private chat: who with, its rule, and what doesn't disappear. Said every time, so it is never mistaken for a saved chat.
         QString text = "⏳ Private chat";
@@ -598,7 +740,7 @@ void ChatWidget::update_header() {
                    "\nNot backed up. Copies, screenshots and anything exported don't disappear. They always see when you've read a message.";
         }
         header_label_->setProperty("contact_name", QString());
-        header_label_->setText(text);
+        set_header(text);
         delivery_box_->setEnabled(false);  // receipts are part of a Private chat's rule
         read_box_->setEnabled(false);
         revoke_button_->setEnabled(false);
@@ -626,7 +768,7 @@ void ChatWidget::update_header() {
         QString text = title + "\nWith " + members;
         if (!waiting.isEmpty()) text += "\nSetting up: can't write to " + waiting + " yet";
         header_label_->setProperty("contact_name", QString());
-        header_label_->setText(text);
+        set_header(text);
         delivery_box_->setEnabled(true);
         read_box_->setEnabled(true);
         revoke_button_->setEnabled(false);
@@ -657,21 +799,21 @@ void ChatWidget::update_header() {
     send_button_->setEnabled(have);
     attach_button_->setEnabled(have);
     if (!have) {
-        header_label_->setText("Choose a contact or group");
+        set_header("Choose a chat");
         return;
     }
     QString name;
     QString note;
-    QString trust = "  (not verified)";
+    QString trust = "Not verified: check their fingerprint with them (⋯ → Check fingerprint…)";
     for (const auto& c : engine_->chats()) {
         if (qstr(c.contact_fp) == current_fp_) {
             name = qstr(c.contact_name);
-            if (c.verified) trust = "  (verified by you)";
+            if (c.verified) trust = "Verified by you";
             if (!c.can_send) note = "\n" + qstr(c.cannot_send_reason);
         }
     }
     header_label_->setProperty("contact_name", name);
-    header_label_->setText(name + trust + note);
+    set_header(name + "\n" + trust + note);
 
     bool delivery = true, read = true;
     engine_->receipts_enabled(current_fp_.toStdString(), &delivery, &read);
@@ -862,13 +1004,16 @@ void ChatWidget::send_current() {
     refresh_if_changed();
 }
 
-void ChatWidget::setup_messaging() {
-    bool ok = false;
-    QString text = QInputDialog::getText(this, "Set up messaging",
-                                         "Paste the relay invite you were given.\n"
-                                         "It looks like pqft-relay://host/…/…",
-                                         QLineEdit::Normal, "", &ok).trimmed();
-    if (!ok || text.isEmpty()) return;
+void ChatWidget::setup_messaging(const QString& preset_invite) {
+    QString text = preset_invite.trimmed();
+    if (text.isEmpty()) {
+        bool ok = false;
+        text = QInputDialog::getText(this, "Set up messaging",
+                                     "Paste the relay invite you were given.\n"
+                                     "It looks like pqft-relay://host/…/…",
+                                     QLineEdit::Normal, "", &ok).trimmed();
+        if (!ok || text.isEmpty()) return;
+    }
 
     auto invite = parse_relay_invite(text.toStdString());
     if (!invite) {
@@ -907,14 +1052,14 @@ void ChatWidget::setup_messaging() {
     refresh();
 }
 
-void ChatWidget::copy_card_to_clipboard() {
-    if (!engine_ || !engine_->is_set_up()) return;
+std::optional<QString> ChatWidget::make_card_text() {
+    if (!engine_ || !engine_->is_set_up()) return std::nullopt;
     bool ok = false;
     QString label = QInputDialog::getText(this, "Contact card",
                                           "Who is this card for? (Only you see this. Each card gets its own\n"
                                           "permission, so you can revoke one without affecting anyone else.)",
                                           QLineEdit::Normal, "", &ok).trimmed();
-    if (!ok) return;
+    if (!ok) return std::nullopt;
 
     QGuiApplication::setOverrideCursor(Qt::WaitCursor);
     std::string card, error;
@@ -922,9 +1067,17 @@ void ChatWidget::copy_card_to_clipboard() {
     QGuiApplication::restoreOverrideCursor();
     if (!made) {
         QMessageBox::warning(this, "Contact card", qstr(error));
-        return;
+        return std::nullopt;
     }
-    QGuiApplication::clipboard()->setText(qstr(card));
+    last_card_label_ = label;
+    return qstr(card);
+}
+
+void ChatWidget::copy_card_to_clipboard() {
+    auto card = make_card_text();
+    if (!card) return;
+    const QString label = last_card_label_;
+    QGuiApplication::clipboard()->setText(*card);
 
     QMessageBox info(QMessageBox::Information, "Contact card",
                      "Your contact card is on the clipboard. Paste it into a message to " +
@@ -1274,6 +1427,123 @@ bool ChatWidget::open_details(const MessageLine& line) {
     return false;
 }
 
+// One list of every conversation, most recent first: contacts, groups (marked "· group") and Private chats (marked with ⏳ and
+// their rule). Built from the three lists' own entries (their labels, unread counts, greyed-out states and tooltips).
+// Settings (in the main window) reaches the messaging actions through these: they press the original buttons, so every
+// check and confirmation behind them is unchanged.
+void ChatWidget::open_setup() { setup_button_->click(); }
+void ChatWidget::setup_with_invite(const QString& invite) { setup_messaging(invite); }
+void ChatWidget::open_relay_invites() { relay_invite_button_->click(); }
+void ChatWidget::open_cards_issued() { cards_button_->click(); }
+void ChatWidget::open_restore() { restore_button_->click(); }
+QString ChatWidget::messaging_status() const {
+    if (!engine_) return "Messaging isn't available";
+    return engine_->is_set_up() ? qstr(engine_->status()) : QString("Messaging isn't set up yet");
+}
+
+QString ChatWidget::waiting_summary() const {
+    QStringList parts;
+    if (waiting_requests_) parts << (waiting_requests_ == 1 ? QString("1 message request") : QString("%1 message requests").arg(static_cast<qulonglong>(waiting_requests_)));
+    if (waiting_invitations_) parts << (waiting_invitations_ == 1 ? QString("1 group invitation") : QString("%1 group invitations").arg(static_cast<qulonglong>(waiting_invitations_)));
+    if (waiting_deletions_) parts << (waiting_deletions_ == 1 ? QString("1 deletion request") : QString("%1 deletion requests").arg(static_cast<qulonglong>(waiting_deletions_)));
+    return parts.join(" · ");
+}
+
+std::vector<ChatEntry> ChatWidget::recent_entries(int count) const {
+    std::vector<ChatEntry> out;
+    for (const auto& e : conversation_entries_) {
+        if (static_cast<int>(out.size()) >= count) break;
+        out.push_back(e);
+    }
+    return out;
+}
+
+void ChatWidget::open_conversation(const QString& key) {
+    const QString id = key.mid(2);
+    if (key.startsWith("c:")) select_contact(id);
+    else if (key.startsWith("g:")) select_group(id);
+    else if (key.startsWith("p:")) select_private(id);
+}
+
+void ChatWidget::set_header(const QString& text) {
+    QString title = text, note;
+    const int cut = text.indexOf('\n');
+    if (cut >= 0) {
+        title = text.left(cut);
+        note = text.mid(cut + 1);
+    }
+    // A Private chat's hourglass: an icon beside the name when icons are available, else the character stays in the text.
+    const bool hourglass = title.startsWith("⏳ ");
+    if (hourglass && app_icons_available()) {
+        title = title.mid(2);
+        header_icon_->setPixmap(app_icon_pixmap("hourglass", 20, QColor("#e8b97a")));
+    }
+    header_icon_->setVisible(hourglass && app_icons_available());
+    header_label_->setText(title);
+    header_note_->setText(note);
+    header_note_->setVisible(!note.isEmpty());
+}
+
+// One list of every conversation, most recent first, each a two-line row (fill_chat_list): contacts ("Verified" / "Not
+// verified" / "Can't message them yet"), groups ("Group · N people") and Private chats ("Private · 1 day after reading").
+void ChatWidget::render_conversations() {
+    if (!conversations_ || !engine_) return;
+    std::vector<ChatEntry> entries;
+    for (const auto& c : engine_->chats()) {
+        ChatEntry e;
+        e.key = "c:" + qstr(c.contact_fp);
+        e.title = qstr(c.contact_name);
+        e.subtitle = !c.can_send ? QString("Can't message them yet") : c.verified ? QString("Verified") : QString("Not verified");
+        e.tooltip = c.can_send ? QString() : qstr(c.cannot_send_reason);
+        e.when = c.last_activity;
+        e.unread = c.unread;
+        e.dimmed = !c.can_send;
+        entries.push_back(std::move(e));
+    }
+    for (const auto& g : engine_->groups()) {
+        ChatEntry e;
+        e.key = "g:" + qstr(g.id);
+        e.title = group_title(g.title);
+        e.subtitle = "Group · " + QString::number(static_cast<qulonglong>(g.members.size() + 1)) + " people" + (g.ready ? QString() : QString(" · setting up"));
+        e.icon = "users";
+        e.when = g.last_activity;
+        e.unread = g.unread;
+        entries.push_back(std::move(e));
+    }
+    for (const auto& p : engine_->private_chats()) {
+        ChatEntry e;
+        e.key = "p:" + qstr(p.id);
+        e.title = qstr(p.contact_name);
+        e.subtitle = "Private · " + private_rule(p.mode, p.timer);
+        e.tooltip = "Messages in this chat disappear " + private_rule(p.mode, p.timer) + ". Never backed up.";
+        e.icon = "hourglass";
+        e.fallback = "⏳";
+        e.when = p.created_at;
+        e.unread = p.unread;
+        entries.push_back(std::move(e));
+    }
+    std::stable_sort(entries.begin(), entries.end(), [](const ChatEntry& a, const ChatEntry& b) { return a.when > b.when; });
+    const bool was_updating = updating_ui_;
+    updating_ui_ = true;
+    fill_chat_list(conversations_, entries);
+    conversation_entries_ = std::move(entries);
+    updating_ui_ = was_updating;
+    sync_conversation_selection();
+}
+
+// Keeps the combined list's highlight on the conversation on screen.
+void ChatWidget::sync_conversation_selection() {
+    if (!conversations_) return;
+    const QString key = !current_fp_.isEmpty() ? "c:" + current_fp_ : !current_group_.isEmpty() ? "g:" + current_group_ : !current_private_.isEmpty() ? "p:" + current_private_ : QString();
+    const bool was_updating = updating_ui_;
+    updating_ui_ = true;
+    int row = -1;
+    for (int i = 0; i < conversations_->count(); i++)
+        if (conversations_->item(i)->data(Qt::UserRole).toString() == key) row = i;
+    conversations_->setCurrentRow(row);
+    updating_ui_ = was_updating;
+}
+
 void ChatWidget::render_privates() {
     updating_ui_ = true;
     privates_->clear();
@@ -1294,6 +1564,7 @@ void ChatWidget::render_privates() {
     privates_->setVisible(row > 0);
     if (select_row >= 0) privates_->setCurrentRow(select_row);
     updating_ui_ = false;
+    render_conversations();
 }
 
 void ChatWidget::select_private(const QString& chat_id) {
@@ -1329,11 +1600,21 @@ void ChatWidget::render_private_messages(bool force_scroll) {
         MessageLine l;
         l.outgoing = m.outgoing;
         l.text = "[" + when + "] " + who + ": " + qstr(m.text) + "   (⏳ " + left + (status.isEmpty() ? QString() : ", " + status) + ")";
+        l.meta = who + " · " + when + " · ⏳ " + left + (status.isEmpty() ? QString() : " · " + status);
+        l.body = qstr(m.text);
         l.copy_text = "[" + when + "] " + who + ": " + qstr(m.text);
         l.private_id = qstr(m.id);
         l.retractable = m.outgoing && !m.read;
         l.tooltip = l.retractable ? "Right-click to take it back: they haven't read it yet" : "Right-click to delete it from this device";
         lines.push_back(std::move(l));
+    }
+    if (lines.empty()) {
+        MessageLine hint;
+        QString rule;
+        for (const auto& c : engine_->private_chats())
+            if (qstr(c.id) == current_private_) rule = private_rule(c.mode, c.timer);
+        hint.text = "No messages yet. Messages in this chat disappear " + rule + ", and are never backed up.";
+        lines.push_back(std::move(hint));
     }
     messages_->set_lines("p:" + current_private_, std::move(lines), force_scroll);
 }
@@ -1561,9 +1842,11 @@ void ChatWidget::show_cards_issued() {
 
 void ChatWidget::revoke_access_for_current() {
     if (current_fp_.isEmpty()) return;
-    QMessageBox ask(QMessageBox::Warning, "Revoke access",
-                    "Revoke every card and permission this person has been given?\n\nThey will no longer be able to send "
-                    "you messages until you give them a new card. Your history stays as it is.",
+    const QString who = header_label_->property("contact_name").toString().isEmpty() ? QString("this person") : header_label_->property("contact_name").toString();
+    QMessageBox ask(QMessageBox::Warning, "Block from messaging",
+                    "Block " + who + " from messaging you?\n\nEvery card and permission you've given them is cancelled, so they "
+                    "can't send you anything. To let them message you again later, send them a new contact card. Your chat "
+                    "history stays as it is.",
                     QMessageBox::Yes | QMessageBox::No, this);
     plain_box(ask);
     ask.setDefaultButton(QMessageBox::No);
@@ -1573,6 +1856,6 @@ void ChatWidget::revoke_access_for_current() {
     QGuiApplication::setOverrideCursor(Qt::WaitCursor);
     const int revoked = engine_->revoke_tokens_for(current_fp_.toStdString(), error);
     QGuiApplication::restoreOverrideCursor();
-    if (revoked < 0) QMessageBox::warning(this, "Revoke access", qstr(error));
-    else QMessageBox::information(this, "Revoke access", revoked ? QString("Revoked %1 permission(s).").arg(revoked) : QString("There was nothing to revoke."));
+    if (revoked < 0) QMessageBox::warning(this, "Block from messaging", qstr(error));
+    else QMessageBox::information(this, "Block from messaging", revoked ? who + " can no longer message you." : who + " had no permission to message you, so there was nothing to cancel.");
 }

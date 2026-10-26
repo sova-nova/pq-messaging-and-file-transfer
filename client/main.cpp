@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QMessageBox>
 
+#include "app_style.h"
 #include "main_window.h"
 #include "platform.h"
 
@@ -8,6 +9,7 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName("pq-file-transfer");
     QCoreApplication::setApplicationName("pq-client");
+    apply_app_style(app);  // the app's own dark look, before any window is made
 
     if (platform_init() != 0) {
         QMessageBox::critical(nullptr, "PQ File Transfer", "Failed to initialize networking.");

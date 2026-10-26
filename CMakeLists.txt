@@ -134,8 +134,20 @@ if(PQ_BUILD_CLIENT)
         client/chat_widget.h
         client/chat_widget.cpp
         client/message_view.cpp
+        client/app_style.cpp
+        client/icons.cpp
+        client/chat_entry.cpp
     )
     target_link_libraries(pq-client PRIVATE pq_core Qt6::Core Qt6::Gui Qt6::Widgets)
+    # Icons (UX polish) need Qt's SVG module. Optional: without it the app builds and works the same, just without icons.
+    find_package(Qt6 QUIET COMPONENTS Svg)
+    if(TARGET Qt6::Svg)
+        target_link_libraries(pq-client PRIVATE Qt6::Svg)
+        target_compile_definitions(pq-client PRIVATE PQ_HAVE_SVG)
+        message(STATUS "Icons: on (Qt SVG module found)")
+    else()
+        message(STATUS "Icons: off. Install Qt's SVG module (e.g. the qt6-svg development package) to have them.")
+    endif()
     pq_warnings(pq-client)
 
     # Optional: remember the key passphrase in the OS keychain via QtKeychain
