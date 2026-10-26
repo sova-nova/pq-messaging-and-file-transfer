@@ -197,6 +197,9 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     for (QWidget* w : std::initializer_list<QWidget*>{requests_button_, invites_button_, deletions_button_, new_group_button_, new_private_button_,
                                                       relay_invite_button_, restore_button_, cards_button_})
         w->setParent(hidden_);
+    status_dot_ = new QLabel("●", this);
+    status_dot_->setAccessibleName("Connection");
+    top->addWidget(status_dot_);
     top->addWidget(status_label_, 1);
     top->addWidget(setup_button_);
     root->addLayout(top);
@@ -208,10 +211,10 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     add_contact_button_->setToolTip("Swap contact cards with someone so you can message each other");
     add_contact_button_->setDefault(false);
     add_contact_button_->setProperty("role", "primary");
-    add_contact_button_->setIcon(app_icon("user-plus", QColor("#ffffff")));
+    set_button_icon(add_contact_button_, "user-plus", QColor("#ffffff"));
     new_button_ = new QPushButton("New", this);
     new_button_->setToolTip("Start a group, or a Private chat whose messages disappear");
-    new_button_->setIcon(app_icon("plus"));
+    set_button_icon(new_button_, "plus");
     auto* new_menu = new QMenu(new_button_);
     new_button_->setMenu(new_menu);
     connect(new_menu, &QMenu::aboutToShow, this, [this, new_menu] {
@@ -300,6 +303,7 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     options_button_ = new QPushButton("⋯", this);
     options_button_->setToolTip("Chat options: receipts, fingerprint, blocking, deleting");
     options_button_->setAccessibleName("Chat options");
+    options_button_->setProperty("role", "icon-menu");
     auto* options_menu = new QMenu(options_button_);
     options_button_->setMenu(options_menu);
     connect(options_menu, &QMenu::aboutToShow, this, [this, options_menu] {
@@ -349,6 +353,7 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     right->addLayout(header_row);
 
     messages_ = new MessageView(this);
+    messages_->set_grouped(QSettings().value("messages/grouped", true).toBool());
     right->addWidget(messages_, 1);
 
     auto* input_row = new QHBoxLayout();
@@ -356,9 +361,9 @@ ChatWidget::ChatWidget(KeyStore& keys, const std::filesystem::path& history_path
     input_->setPlaceholderText("Write a message…");
     send_button_ = new QPushButton("Send", this);
     send_button_->setProperty("role", "primary");
-    send_button_->setIcon(app_icon("send", QColor("#ffffff")));
+    set_button_icon(send_button_, "send", QColor("#ffffff"));
     attach_button_ = new QPushButton("Attach…", this);
-    attach_button_->setIcon(app_icon("paperclip"));
+    set_button_icon(attach_button_, "paperclip");
     attach_button_->setToolTip("Send a file. What you have typed is sent with it as a caption.");
     input_row->addWidget(input_, 1);
     input_row->addWidget(attach_button_);
@@ -523,7 +528,13 @@ void ChatWidget::report_unread() {
 void ChatWidget::refresh_if_changed() {
     if (!engine_) return;
 
-    status_label_->setText(engine_->is_set_up() ? qstr(engine_->status()) : "Messaging isn't set up yet");
+    {
+        const ConnectionState state = connection_state();
+        status_label_->setText(state.title);
+        status_label_->setToolTip(state.detail);
+        status_dot_->setStyleSheet("color: " + state.color + ";");
+        status_dot_->setToolTip(state.detail);
+    }
     setup_button_->setVisible(!engine_->is_set_up());
     cards_button_->setEnabled(engine_->is_set_up());
     new_group_button_->setEnabled(engine_->is_set_up());
@@ -653,6 +664,7 @@ void ChatWidget::render_messages(bool force_scroll) {
             l.text = "[" + when + "] (deleted by agreement)";
             l.meta = who + " · " + when;
             l.body = "(deleted by agreement)";
+            l.when = m.sent_at;
             lines.push_back(std::move(l));
             continue;
         }
@@ -660,6 +672,11 @@ void ChatWidget::render_messages(bool force_scroll) {
         l.text = "[" + when + "] " + who + ": " + body + (m.is_attachment ? QString() : status_word(m.status, m.outgoing));
         if (m.gap) l.text += "\n    (a message before this one is missing)";
         l.meta = who + " · " + when + (m.is_attachment ? QString() : meta_status(status_word(m.status, m.outgoing)));
+        l.group_key = m.outgoing ? QString("me") : QString("them");
+        l.when = m.sent_at;
+        l.meta_short = who + " · " + QDateTime::fromSecsSinceEpoch(m.sent_at).toString("HH:mm");
+        l.status = m.is_attachment ? QString() : meta_status(status_word(m.status, m.outgoing)).mid(3);
+        l.tooltip = "Sent " + when + (l.status.isEmpty() ? QString() : " · " + l.status);
         l.body = body + (m.gap ? QString("\n(a message before this one is missing)") : QString());
         l.copy_text = m.is_attachment ? "[" + when + "] " + who + ": " + qstr(m.attachment.name) + " (" + human_size(m.attachment.size) + ")" + (m.text.empty() ? QString() : "\n" + qstr(m.text))
                                       : "[" + when + "] " + who + ": " + qstr(m.text);
@@ -698,6 +715,7 @@ void ChatWidget::render_group_messages(bool force_scroll) {
             l.text = "[" + when + "] (deleted by agreement)";
             l.meta = who + " · " + when;
             l.body = "(deleted by agreement)";
+            l.when = m.sent_at;
             lines.push_back(std::move(l));
             continue;
         }
@@ -707,6 +725,11 @@ void ChatWidget::render_group_messages(bool force_scroll) {
         l.text = "[" + when + "] " + who + ": " + body + (m.is_attachment ? QString() : status);
         if (m.gap) l.text += "\n    (a message before this one is missing)";
         l.meta = who + " · " + when + (m.is_attachment ? QString() : meta_status(status));
+        l.group_key = m.outgoing ? QString("me") : "member:" + qstr(m.sender_name);
+        l.when = m.sent_at;
+        l.meta_short = who + " · " + QDateTime::fromSecsSinceEpoch(m.sent_at).toString("HH:mm");
+        l.status = m.is_attachment ? QString() : meta_status(status).mid(3);
+        l.tooltip = "Sent " + when + (l.status.isEmpty() ? QString() : " · " + l.status);
         l.body = body + (m.gap ? QString("\n(a message before this one is missing)") : QString());
         l.copy_text = m.is_attachment ? "[" + when + "] " + who + ": " + qstr(m.attachment.name) + " (" + human_size(m.attachment.size) + ")" + (m.text.empty() ? QString() : "\n" + qstr(m.text))
                                       : "[" + when + "] " + who + ": " + qstr(m.text);
@@ -1438,7 +1461,24 @@ void ChatWidget::open_cards_issued() { cards_button_->click(); }
 void ChatWidget::open_restore() { restore_button_->click(); }
 QString ChatWidget::messaging_status() const {
     if (!engine_) return "Messaging isn't available";
-    return engine_->is_set_up() ? qstr(engine_->status()) : QString("Messaging isn't set up yet");
+    const ConnectionState state = connection_state();
+    return state.detail.isEmpty() || state.detail == state.title ? state.title : state.title + "\n(" + state.detail + ")";
+}
+
+ChatWidget::ConnectionState ChatWidget::connection_state() const {
+    if (!engine_ || !engine_->is_set_up())
+        return {"Messaging isn't set up", "Set up messaging with the invite you were given.", "#8a8a92"};
+    const QString raw = qstr(engine_->status());
+    if (engine_->connected()) return {"Online · messages send and arrive", raw, "#5cc4a0"};
+    if (raw.contains("identity has changed")) return {"Can't connect: the service's identity has changed", raw, "#ff8a80"};
+    if (raw.startsWith("Can't reach") || raw.startsWith("Disconnected"))
+        return {"Offline · messages wait, and send when you're back online", raw, "#ff8a80"};
+    return {"Connecting… · messages will send when it's back", raw, "#f0b65a"};
+}
+
+void ChatWidget::set_grouped(bool grouped) {
+    messages_->set_grouped(grouped);
+    render_messages(false);
 }
 
 QString ChatWidget::waiting_summary() const {

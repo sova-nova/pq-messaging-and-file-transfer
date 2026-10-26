@@ -12,3 +12,6 @@
 bool app_icons_available();
 QPixmap app_icon_pixmap(const QString& name, int size, const QColor& color);
 QIcon app_icon(const QString& name, const QColor& color = QColor("#ececee"));
+class QAbstractButton;
+// Puts an icon on a button, with a gap before its text (Qt otherwise draws them almost touching). No-op without icons.
+void set_button_icon(QAbstractButton* button, const QString& name, const QColor& color = QColor("#ececee"));

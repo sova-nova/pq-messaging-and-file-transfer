@@ -3,7 +3,11 @@
 #include <QApplication>
 #include <QColor>
 #include <QPalette>
+#include <QDialog>
+#include <QGroupBox>
+#include <QLayout>
 #include <QStyleFactory>
+#include <QWidget>
 
 namespace {
 
@@ -13,6 +17,8 @@ QLabel[role="title"] { font-size: 13pt; font-weight: 600; }
 QLabel[role="section"] { font-weight: 600; color: #c4c4ca; padding-top: 8px; }
 QLabel[role="muted"] { color: #b6b6bd; }
 QLabel[role="note"] { color: #b6b6bd; }
+QPushButton[role="icon-menu"] { padding: 8px 14px; }
+QPushButton[role="icon-menu"]::menu-indicator { image: none; width: 0px; }
 QLabel[role="tile-title"] { font-size: 12pt; font-weight: 600; }
 QLabel[role="tile-text"] { color: #b6b6bd; }
 QPushButton[role="tile-primary"] QLabel { color: #ffffff; }
@@ -26,7 +32,7 @@ QToolTip { background: #36363a; color: #ececee; border: 1px solid #55555c; paddi
 
 QPushButton {
     background: #36363a; color: #ececee; border: 1px solid #55555c; border-radius: 6px;
-    padding: 6px 14px; min-height: 22px;
+    padding: 8px 16px; min-height: 20px;
 }
 QPushButton:hover { background: #3f3f44; border-color: #6a6a72; }
 QPushButton:pressed { background: #2f2f33; }
@@ -65,7 +71,7 @@ QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget {
     background: #1f1f21; color: #ececee; border: 1px solid #4a4a50; border-radius: 6px;
     selection-background-color: #2f6bc4; selection-color: #ffffff;
 }
-QLineEdit { padding: 5px 8px; min-height: 22px; }
+QLineEdit { padding: 7px 10px; min-height: 20px; }
 QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus, QListWidget:focus { border-color: #5b8fd6; }
 QLineEdit:disabled { color: #7a7a80; }
 
@@ -74,11 +80,14 @@ QListWidget::item { padding: 8px 6px; border-radius: 6px; }
 QListWidget::item:hover { background: #303036; }
 QListWidget::item:selected { background: #3a3f4a; color: #ffffff; }
 
+/* A card's title sits inside it, in space its layout reserves (apply_spacing: a 40 px top margin). Not above it with
+   margin-top: Qt leaves that space out of a group box's minimum size, so a dialog came out short and squeezed its contents
+   (Add a contact's paste box overlapped the label beneath it). */
 QGroupBox {
     background: #2f2f32; border: 1px solid #45454b; border-radius: 10px;
-    margin-top: 22px; padding: 14px 12px 12px 12px; font-weight: 600;
+    margin-top: 0; padding: 0; font-weight: 600;
 }
-QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 4px; color: #ececee; }
+QGroupBox::title { subcontrol-origin: padding; subcontrol-position: top left; left: 16px; top: 12px; padding: 0; color: #ececee; }
 
 QTabWidget::pane { border: none; border-top: 1px solid #45454b; }
 QTabBar::tab { background: transparent; color: #c4c4ca; padding: 10px 16px; border: none; border-bottom: 3px solid transparent; }
@@ -120,4 +129,19 @@ void apply_app_style(QApplication& app) {
     for (auto role : {QPalette::WindowText, QPalette::Text, QPalette::ButtonText}) p.setColor(QPalette::Disabled, role, disabled);
     app.setPalette(p);
     app.setStyleSheet(STYLE_SHEET);
+}
+
+void apply_spacing(QWidget* root) {
+    if (!root) return;
+    if (QLayout* l = root->layout()) {
+        l->setContentsMargins(16, 16, 16, 16);
+        l->setSpacing(12);
+        if (qobject_cast<QDialog*>(root)) l->setSizeConstraint(QLayout::SetMinimumSize);  // never smaller than its contents
+    }
+    for (QGroupBox* box : root->findChildren<QGroupBox*>()) {
+        if (QLayout* l = box->layout()) {
+            l->setContentsMargins(16, 40, 16, 16);  // the top 40 holds the card's title (see the style sheet)
+            l->setSpacing(10);
+        }
+    }
 }

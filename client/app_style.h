@@ -14,6 +14,11 @@ class QApplication;
 // sheet makes Qt drop the combo box's arrow and menus' check marks.
 void apply_app_style(QApplication& app);
 
+class QWidget;
+// The spacing scale, applied to a page or dialog once it's built: 16 px around the page and inside every card (group box),
+// 12 px between things. A dialog also never gets smaller than its contents (so nothing in it can overlap).
+void apply_spacing(QWidget* root);
+
 // Colours for the few places that set one in code.
 namespace app_colors {
 constexpr const char* error = "#ff8a80";

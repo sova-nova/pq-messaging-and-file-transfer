@@ -1,5 +1,7 @@
 #include "icons.h"
 
+#include <QAbstractButton>
+
 #ifdef PQ_HAVE_SVG
 #include <QByteArray>
 #include <QGuiApplication>
@@ -61,4 +63,11 @@ QPixmap app_icon_pixmap(const QString& name, int size, const QColor& color) {
 QIcon app_icon(const QString& name, const QColor& color) {
     const QPixmap pixmap = app_icon_pixmap(name, 32, color);
     return pixmap.isNull() ? QIcon() : QIcon(pixmap);
+}
+
+void set_button_icon(QAbstractButton* button, const QString& name, const QColor& color) {
+    const QIcon icon = app_icon(name, color);
+    if (icon.isNull()) return;
+    button->setIcon(icon);
+    if (!button->text().isEmpty() && !button->text().startsWith(' ')) button->setText("  " + button->text());
 }

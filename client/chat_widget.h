@@ -51,6 +51,16 @@ public:
     void open_cards_issued();
     void open_restore();
     QString messaging_status() const;
+    // The connection, in words people understand, with a colour for its dot: Online (green), Connecting… (amber), Offline
+    // or a problem (red), not set up (grey). `detail` is the relay's own wording, for a tooltip.
+    struct ConnectionState {
+        QString title;
+        QString detail;
+        QString color;
+    };
+    ConnectionState connection_state() const;
+    // Messages sent close together share a box (the default), or each has its own. Saved as "messages/grouped".
+    void set_grouped(bool grouped);
     // For Home (UX step 5).
     void set_on_changed(std::function<void()> f) { on_changed_ = std::move(f); }  // after each look for news
     QString waiting_summary() const;  // "1 message request · 2 group invitations", or empty
@@ -133,6 +143,7 @@ private:
     QPushButton* options_button_ = nullptr;   // ⋯ in the chat header
     QListWidget* conversations_ = nullptr;    // one list: contacts, groups and Private chats, most recent first
     std::vector<ChatEntry> conversation_entries_;  // what it shows
+    QLabel* status_dot_ = nullptr;            // the coloured dot before the connection status
     QLabel* header_icon_ = nullptr;           // an hourglass beside a Private chat's name (when icons are available)
     QLabel* header_note_ = nullptr;           // the header's smaller second part: trust, members, a Private chat's limits
     void set_header(const QString& text);     // first line: the title; the rest: the note

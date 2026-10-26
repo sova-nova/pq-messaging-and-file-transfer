@@ -90,6 +90,7 @@ private:
     QWidget* files_page_ = nullptr;
     QWidget* home_page_ = nullptr;
     QLabel* home_status_ = nullptr;
+    QLabel* home_status_dot_ = nullptr;
     QPushButton* home_setup_button_ = nullptr;
     QWidget* home_waiting_ = nullptr;
     QLabel* home_waiting_text_ = nullptr;

@@ -5,11 +5,38 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QSizePolicy>
+#include <QPainter>
 #include <QVBoxLayout>
 
 #include "icons.h"
 
 namespace {
+
+// A label that ends with "…" when its text doesn't fit, instead of cutting a word in half.
+class ElidedLabel : public QLabel {
+public:
+    using QLabel::QLabel;
+    QSize minimumSizeHint() const override { return QSize(20, QLabel::minimumSizeHint().height()); }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.setPen(palette().color(foregroundRole()));
+        painter.setFont(font());
+        const QRect area = contentsRect();
+        painter.drawText(area, Qt::AlignLeft | Qt::AlignVCenter, fontMetrics().elidedText(text(), Qt::ElideRight, area.width()));
+    }
+};
+
+QLabel* elided_label(const QString& text, const char* role, QWidget* parent) {
+    auto* label = new ElidedLabel(text, parent);
+    label->setTextFormat(Qt::PlainText);
+    label->setProperty("role", role);
+    label->setAttribute(Qt::WA_TransparentForMouseEvents);
+    label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);  // may be narrower than its text
+    return label;
+}
 
 QLabel* row_label(const QString& text, const char* role, QWidget* parent) {
     auto* label = new QLabel(text, parent);
@@ -37,8 +64,8 @@ QWidget* make_row(const ChatEntry& e, QWidget* parent) {
 
     auto* text = new QVBoxLayout();
     text->setSpacing(1);
-    text->addWidget(row_label(e.title, e.dimmed ? "entry-title-dim" : "entry-title", row));
-    if (!e.subtitle.isEmpty()) text->addWidget(row_label(e.subtitle, "entry-sub", row));
+    text->addWidget(elided_label(e.title, e.dimmed ? "entry-title-dim" : "entry-title", row));
+    if (!e.subtitle.isEmpty()) text->addWidget(elided_label(e.subtitle, "entry-sub", row));
     layout->addLayout(text, 1);
 
     auto* side = new QVBoxLayout();
@@ -67,7 +94,7 @@ void fill_chat_list(QListWidget* list, const std::vector<ChatEntry>& entries) {
         auto* item = new QListWidgetItem();  // no visible text: the row widget draws it (text here would show underneath)
         item->setData(Qt::UserRole, e.key);
         item->setData(Qt::AccessibleTextRole, e.title + (e.subtitle.isEmpty() ? QString() : ", " + e.subtitle));
-        item->setToolTip(e.tooltip);
+        item->setToolTip(e.tooltip.isEmpty() ? e.title + (e.subtitle.isEmpty() ? QString() : "\n" + e.subtitle) : e.tooltip);  // the full text
         item->setSizeHint(QSize(0, 58));
         list->addItem(item);
         list->setItemWidget(item, make_row(e, list));

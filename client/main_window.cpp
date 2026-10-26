@@ -233,7 +233,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     send_layout->addStretch(1);
     send_button_ = new QPushButton("Choose file and send…", send_box);
     send_button_->setProperty("role", "primary");
-    send_button_->setIcon(app_icon("upload", QColor("#ffffff")));
+    set_button_icon(send_button_, "upload", QColor("#ffffff"));
     send_button_->setMinimumHeight(40);
     send_layout->addWidget(send_button_);
     cards->addWidget(send_box, 1);
@@ -248,7 +248,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     receive_layout->addWidget(receive_edit_);
     receive_layout->addStretch(1);
     receive_button_ = new QPushButton("Download", receive_box);
-    receive_button_->setIcon(app_icon("download"));
+    set_button_icon(receive_button_, "download");
     receive_button_->setMinimumHeight(40);
     receive_layout->addWidget(receive_button_);
     cards->addWidget(receive_box, 1);
@@ -361,7 +361,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     // Settings, reachable from either tab; its messaging part works through the Chats tab's own actions.
     auto* settings_button = new QPushButton("Settings…", tabs);
-    settings_button->setIcon(app_icon("settings"));
+    set_button_icon(settings_button, "settings");
     settings_button->setToolTip("Your fingerprint and contact card, key protection, relay invites, issued cards, restoring history");
     tabs->setCornerWidget(settings_button, Qt::TopRightCorner);
     connect(settings_button, &QPushButton::clicked, this, [this] { open_settings(); });
@@ -382,6 +382,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     messaging_buttons->addStretch(1);
     messaging_box_layout->addLayout(messaging_buttons);
     settings_layout_->addWidget(messaging_box);
+    auto* appearance_box = new QGroupBox("Appearance", settings_dialog_);
+    auto* appearance_layout = new QVBoxLayout(appearance_box);
+    auto* grouped = new QRadioButton("Group messages sent close together (one name and time for a few messages in a row)", appearance_box);
+    auto* separate = new QRadioButton("Show every message on its own, with its time and status", appearance_box);
+    (QSettings().value("messages/grouped", true).toBool() ? grouped : separate)->setChecked(true);
+    appearance_layout->addWidget(plain_label("Messages in chats:", appearance_box));
+    appearance_layout->addWidget(grouped);
+    appearance_layout->addWidget(separate);
+    settings_layout_->addWidget(appearance_box);
+    connect(grouped, &QRadioButton::toggled, this, [this](bool on) {
+        QSettings().setValue("messages/grouped", on);
+        chat_widget_->set_grouped(on);
+    });
     // Each opens its own window: Settings closes first, so the two never stack up.
     connect(settings_setup_button_, &QPushButton::clicked, this, [this] { settings_dialog_->accept(); chat_widget_->open_setup(); });
     connect(settings_invites_button_, &QPushButton::clicked, this, [this] { settings_dialog_->accept(); chat_widget_->open_relay_invites(); });
@@ -585,6 +598,7 @@ bool MainWindow::run_first_run_guide(FirstRunChoices& out) {
         dialog.accept();
     });
     show_step(0);
+    apply_spacing(&dialog);
     const bool finished = dialog.exec() == QDialog::Accepted;
     if (!finished) {
         std::fill(out.passphrase.begin(), out.passphrase.end(), '\0');
@@ -686,6 +700,9 @@ void MainWindow::build_home() {
     home_status_->setWordWrap(true);
     home_setup_button_ = new QPushButton("Set up messaging…", home_page_);
     connect(home_setup_button_, &QPushButton::clicked, this, [this] { chat_widget_->open_setup(); });
+    home_status_dot_ = new QLabel("●", home_page_);
+    home_status_dot_->setAccessibleName("Connection");
+    status_row->addWidget(home_status_dot_);
     status_row->addWidget(home_status_, 1);
     status_row->addWidget(home_setup_button_);
     layout->addLayout(status_row);
@@ -725,7 +742,6 @@ void MainWindow::build_home() {
             picture->setAttribute(Qt::WA_TransparentForMouseEvents);
             inner->addWidget(picture);
         }
-        inner->addStretch(1);
         auto* t = plain_label(title, b);
         t->setProperty("role", "tile-title");
         t->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -734,6 +750,7 @@ void MainWindow::build_home() {
         d->setProperty("role", "tile-text");
         d->setAttribute(Qt::WA_TransparentForMouseEvents);
         inner->addWidget(d);
+        inner->addStretch(1);  // below the text, so every tile's title sits at the same height
         if (text_label) *text_label = d;
         actions->addWidget(b, 1);
         return b;
@@ -779,6 +796,7 @@ void MainWindow::build_home() {
     tabs_->insertTab(0, home_page_, "Home");
     tabs_->tabBar()->moveTab(tabs_->indexOf(chat_widget_), 1);
     tabs_->setCurrentWidget(home_page_);
+    for (QWidget* page : {files_page_, home_page_, static_cast<QWidget*>(settings_dialog_), static_cast<QWidget*>(chat_widget_)}) apply_spacing(page);
     refresh_home();
 }
 
@@ -793,7 +811,13 @@ void MainWindow::refresh_home() {
     for (const auto& r : recent) signature += "|" + r.key + "=" + r.title + "/" + r.subtitle + "/" + QString::number(static_cast<qulonglong>(r.unread)) + "/" + QString::number(static_cast<qlonglong>(r.when));
     if (signature == home_signature_) return;  // nothing changed: leave it alone
     home_signature_ = signature;
-    home_status_->setText(set_up ? "Messaging: " + status : QString("Messaging isn't set up yet. Set it up to chat with your contacts (you'll need an invite from a relay)."));
+    {
+        const auto state = chat_widget_->connection_state();
+        home_status_->setText(set_up ? state.title : QString("Messaging isn't set up yet. Set it up to chat with your contacts (you'll need an invite)."));
+        home_status_->setToolTip(state.detail);
+        home_status_dot_->setStyleSheet("color: " + state.color + ";");
+        home_status_dot_->setToolTip(state.detail);
+    }
     home_setup_button_->setVisible(!set_up);
     home_waiting_text_->setText("Waiting for you: " + waiting);
     home_waiting_->setVisible(!waiting.isEmpty());
@@ -962,7 +986,7 @@ void MainWindow::add_contact() {
     auto* card_edit = new QPlainTextEdit(theirs);
     card_edit->setPlaceholderText("Paste the card they sent you");
     card_edit->setTabChangesFocus(true);
-    card_edit->setFixedHeight(90);
+    card_edit->setMinimumHeight(90);
     theirs_layout->addWidget(card_edit);
     theirs_layout->addWidget(plain_label("Name them (optional: their card suggests a name)", theirs));
     auto* name_edit = new QLineEdit(theirs);
@@ -1002,6 +1026,8 @@ void MainWindow::add_contact() {
     connect(add_button, &QPushButton::clicked, &dialog, [this, &dialog, card_edit, name_edit] {
         if (add_contact_from_card_text(card_edit->toPlainText(), name_edit->text().trimmed())) dialog.accept();
     });
+    apply_spacing(&dialog);
+    dialog.adjustSize();  // size from the finished layout, after the spacing is in place
     dialog.exec();
     if (use_files) add_contact_from_files();
 }
